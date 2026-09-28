@@ -9,6 +9,8 @@ CLIP STUDIO PAINTの「ヒストリー」パレットのように、AviUtl2の�
 
 AviUtl2の表示言語が日本語・英語・韓国語・中国語のいずれの場合でも動作します。
 
+https://github.com/user-attachments/assets/e82aabb8-fc6e-4756-937e-c6f41a7998be
+
 ## 導入方法
 
 1. 次のどちらかの方法でインストールします。
