@@ -1,0 +1,13 @@
+# 開発用のファイル (公開しない)
+build.bat
+make_package.ps1
+test.aup2
+
+# ビルドの途中で生成されるファイル
+*.obj
+*.exp
+*.lib
+
+# 配布用パッケージ (リリースにのみ添付する)
+*.au2pkg.zip
+demo.mp4
