@@ -45,10 +45,13 @@
 #define WM_APP_INIT				(WM_APP + 5)
 #define WM_APP_JUMP_KEEP		(WM_APP + 6)	// クリックで戻している間、投げたメッセージを絶やさずユーザーの入力を後回しにする
 #define WM_APP_GROUP_COMMAND	(WM_APP + 7)	// グループ化・グループ解除のコマンドを本体が処理し終えてから確かめるため
+#define WM_APP_EXTERNAL_FINISHED	(WM_APP + 8)	// Keychain to Transformの操作が終わった (wparam: 操作の結果)
 
 #define TIMER_ID_JUMP_TIMEOUT	1
 #define TIMER_ID_BUSY			2		// 戻している途中の表示を回す
 #define TIMER_ID_UNNOTIFIED		3		// 観測したUndo/Redoに通知が来ないか確かめる
+#define TIMER_ID_INIT			4		// 初期化の時にメインウィンドウ・メニューがまだ無ければ、少し待ってもう一度試す
+#define INIT_RETRY_MS			100
 #define UNNOTIFIED_WAIT_MS		200		// 観測したUndo/Redoに、この時間通知が来なければプロジェクトファイルを読んで確かめる
 #define BUSY_INTERVAL_MS		80
 #define BUSY_DOTS				8		// ぐるぐるマークの点の数
@@ -69,7 +72,7 @@ HFONT g_font = nullptr;
 
 COMMON_PLUGIN_TABLE common_plugin_table = {
 	PLUGIN_NAME,
-	L"EditHistory version 0.1 By teruyoshi",
+	L"EditHistory version 0.2 By teruyoshi",
 };
 
 EXTERN_C __declspec(dllexport) void InitializeLogger(LOG_HANDLE* handle) {
@@ -208,6 +211,9 @@ struct SceneHistory {
 std::map<int, SceneHistory> g_scenes;
 int g_scene_id = -1;
 bool g_initialized = false;
+// 本体の起動(プロジェクトの初期化)が済み、編集ハンドルの関数を使えるか。
+// register_project_load_handlerのコールバック(起動時のプロジェクトの初期化でも呼ばれる)が来たら立てる
+bool g_host_ready = false;
 
 SceneHistory& current_history() { return g_scenes[g_scene_id]; }
 
@@ -1538,7 +1544,29 @@ void read_shortcuts() {
 
 extern HWND g_hwnd;
 
+//=======================================================================
+//	Keychain to Transformとの連携
+//	Keychain to Transformの「操作中の変更をUndo 1件にまとめる」方式では、操作中に本体のUndo(メインメニューのWM_COMMAND)と
+//	書き込みを繰り返す。途中の状態を読むとUndoと書き込みを区別できず記録が壊れるため、操作中はメインウィンドウに付く印
+//	(プロパティ)を見て、通知とUndo/Redoのコマンドの観測をまとめ、終了のメッセージ(wParamに操作の結果)を受けてから1回だけ処理する。
+//	  結果 0 = 何も書き込まなかった / 1 = 確定した(本体のUndoに1件) /
+//	       2 = 書き込んだ後にキャンセルした(状態は開始時のままだが、本体のやり直せる分はキャンセルした変形の1件に置き換わった) /
+//	       3 = 途中でまとめる方式をやめた
+//=======================================================================
+const wchar_t* KEYCHAIN_ACTIVE_PROP_NAME = L"KeychainToTransform.SingleUndoActive";
+const wchar_t* KEYCHAIN_FINISHED_MESSAGE_NAME = L"KeychainToTransform.SingleUndoFinished";
+const UINT g_keychain_finished_message = RegisterWindowMessageW(KEYCHAIN_FINISHED_MESSAGE_NAME);
+enum { KEYCHAIN_RESULT_NO_WRITE = 0, KEYCHAIN_RESULT_COMMITTED = 1, KEYCHAIN_RESULT_CANCELED = 2, KEYCHAIN_RESULT_FALLBACK = 3 };
+
+// Keychain to TransformがUndoを1件にまとめる方式で操作中か
+bool is_keychain_active() {
+	HWND main = edit_handle ? edit_handle->get_host_app_window() : nullptr;
+	return main && GetPropW(main, KEYCHAIN_ACTIVE_PROP_NAME) != nullptr;
+}
+
 void observe_command(Command cmd) {
+	// Keychain to Transformが操作中に送るUndoは、操作全体を1件の編集として扱うので観測しない
+	if (is_keychain_active()) return;
 	g_observed.push_back({ cmd, GetTickCount64() });
 	// グループ化のUndo/Redoは通知が来ないので、来なかった時にプロジェクトファイルを読んで確かめる
 	if (g_track_layer_settings) SetTimer(g_hwnd, TIMER_ID_UNNOTIFIED, UNNOTIFIED_WAIT_MS, nullptr);
@@ -1643,7 +1671,9 @@ LRESULT CALLBACK callwnd_hook_proc(int code, WPARAM wparam, LPARAM lparam) {
 }
 
 LRESULT CALLBACK main_subclass_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam, UINT_PTR, DWORD_PTR) {
-	if (message == WM_COMMAND && lparam == 0) {
+	if (message == g_keychain_finished_message) {
+		PostMessageW(g_hwnd, WM_APP_EXTERNAL_FINISHED, wparam, 0);
+	} else if (message == WM_COMMAND && lparam == 0) {
 		UINT id = LOWORD(wparam);
 		if (id && id == g_undo_id) observe_command(CMD_UNDO);
 		else if (id && id == g_redo_id) observe_command(CMD_REDO);
@@ -2482,10 +2512,15 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
 		return (LRESULT)g_back_brush;
 
 	case WM_APP_INIT:
-		if (!g_initialized) {
+		// 本体の起動(プロジェクトの初期化)が済むまで初期化しない。
+		// 編集ハンドルの関数はRegisterPluginの処理の間は使えない(SDKのEDIT_HANDLEの説明)。
+		// 起動時に「スクリプト・プラグインの追加」の確認ダイアログが出ると、そのメッセージループで投げておいたメッセージが
+		// 起動の途中に処理される。そこで編集ハンドルの関数を呼ぶと本体が落ちた(アクセス違反)
+		if (!g_initialized && g_host_ready) {
 			HWND main = edit_handle->get_host_app_window();
 			if (!main || !GetMenu(main)) {
-				PostMessageW(hwnd, WM_APP_INIT, 0, 0);	// メインウィンドウがまだ無ければ後でもう一度
+				// メインウィンドウ・メニューがまだ無ければ後でもう一度 (投げ直すと空回りするのでタイマーで待つ)
+				SetTimer(hwnd, TIMER_ID_INIT, INIT_RETRY_MS, nullptr);
 				return 0;
 			}
 			read_shortcuts();
@@ -2510,11 +2545,32 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
 			g_buttons = 0;
 			g_button_down = false;
 		}
-		if (g_button_down && !g_jump.active) {
+		if (is_keychain_active()) {
+			// Keychain to Transformの操作中はまとめて、終了のメッセージで処理する
+			g_pending_update = true;
+		} else if (g_button_down && !g_jump.active) {
 			// 押下中はまとめて、解放で処理する (一覧のクリックで戻している途中は、押下中でもすぐ処理する)
 			g_pending_update = true;
 		} else {
 			process_update();
+		}
+		return 0;
+
+	case WM_APP_EXTERNAL_FINISHED:
+		// Keychain to Transformの操作が終わった
+		if (!g_initialized) return 0;
+		if (wparam == KEYCHAIN_RESULT_CANCELED) {
+			// 本体のやり直せる分は、キャンセルした変形の1件に置き換わっている。写しのやり直せる分は本体に無いので捨てる
+			// (その後に本体でやり直すと写しに行き先が無いので、従来どおり取り直しになる)
+			ensure_scene();
+			SceneHistory& sh = current_history();
+			if (sh.pos + 1 < (int)sh.entries.size()) sh.entries.erase(sh.entries.begin() + sh.pos + 1, sh.entries.end());
+		}
+		if (g_pending_update && !g_button_down) {
+			g_pending_update = false;
+			process_update();
+		} else {
+			update_list();
 		}
 		return 0;
 
@@ -2588,6 +2644,8 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
 		g_scene_id = -1;
 		g_observed.clear();
 		g_pending_update = false;
+		// プロジェクトの初期化・読み込みが済んだので、編集ハンドルの関数を使える (起動時にも必ず1回来る)
+		g_host_ready = true;
 		if (g_initialized) {
 			ensure_scene();
 			update_list();
@@ -2597,6 +2655,11 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
 		return 0;
 
 	case WM_TIMER:
+		if (wparam == TIMER_ID_INIT) {
+			KillTimer(hwnd, TIMER_ID_INIT);
+			PostMessageW(hwnd, WM_APP_INIT, 0, 0);
+			return 0;
+		}
 		if (wparam == TIMER_ID_UNNOTIFIED) {
 			KillTimer(hwnd, TIMER_ID_UNNOTIFIED);
 			if (!g_jump.active) check_unnotified_command();
@@ -2681,5 +2744,6 @@ EXTERN_C __declspec(dllexport) void RegisterPlugin(HOST_APP_TABLE* host) {
 	host->register_event_listener(EVENT_TYPE::UPDATE_OBJECT, nullptr, on_object_updated);
 	host->register_event_listener(EVENT_TYPE::CHANGE_EDIT_SCENE, nullptr, on_scene_changed);
 	host->register_project_load_handler(on_project_load);
-	PostMessageW(g_hwnd, WM_APP_INIT, 0, 0);
+	// 初期化(フック・メニューの読み取り・状態の読み取り)は、起動時のプロジェクトの初期化の通知(on_project_load)を待ってから行う。
+	// ここで自分宛てに投げておくと、起動の途中に出る確認ダイアログのメッセージループで処理されて本体が落ちる
 }

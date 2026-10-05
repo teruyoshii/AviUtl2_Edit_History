@@ -1,4 +1,4 @@
-Edit History v0.1
+Edit History v0.2
 
 CLIP STUDIO PAINTの「ヒストリー」パレットのように、AviUtl2の編集履歴を一覧で表示するプラグインです。
 一覧の項目をクリックすると、その時点の状態まで本体の「元に戻す」「やり直し」で戻せます。
