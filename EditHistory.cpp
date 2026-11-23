@@ -2,12 +2,11 @@
 //	EditHistory for AviUtl ExEdit2
 //	編集履歴を一覧表示し、項目をクリックするとその時点まで本体の「元に戻す」「やり直し」で戻すプラグイン
 //
-//	SDKにはUndo履歴を扱うAPIが無いため、次の方法で本体のUndo履歴の写しを作る。
-//	・UPDATE_OBJECTの通知ごとに状態を読み取り、状態のハッシュを記録する
-//	・マウスの押下中の通知はまとめ、解放で1件に区切る(ドラッグ1回=本体のUndo 1件)
-//	・Undo/Redoの向きは、ショートカットキー(キーボードフック)とメニュー(WM_COMMAND)の観測で知る
-//	・行き先は、その向きでハッシュが一致する最も近い項目を探して決める
-//	・「元に戻す」「やり直し」の有効・無効は、WM_INITMENUPOPUPを送ってからメニューを読む
+//	SDKにはUndo履歴を扱うAPIが無いため、本体のメモリ上にあるUndo履歴(Undo::UndoService)を直接読んで写しを作る。
+//	・UndoServiceの場所は本体の「元に戻す」の処理の先頭の命令から、Undoの項目・設定項目の種類はRTTIのクラス名から、起動時に割り出す
+//	・UPDATE_OBJECTの通知と定期的な確認で、本体の履歴(段の並びと現在位置)の変化を見て写しを合わせる
+//	・各段の説明は、その段のUndoの項目が持つ変更前・変更後の状態と、対象のオブジェクト・エフェクトをメモリから読んで作る
+//	本体のメモリには書き込まない。読み取りは例外を捕まえて行い、割り出せない版では機能を止める
 //
 //	By teruyoshi
 //----------------------------------------------------------------------------------
@@ -19,14 +18,11 @@
 #include <vector>
 #include <map>
 #include <set>
-#include <deque>
 #include <cstdint>
 #include <cstdio>
+#include <cmath>
 #include <algorithm>
 #include <tuple>
-#include <cmath>
-#include <fstream>
-#include <iterator>
 
 #include "plugin2.h"
 #include "logger2.h"
@@ -38,30 +34,23 @@
 #define IDC_LIST			1001
 
 // 自ウィンドウへ処理を委譲するメッセージ
-#define WM_APP_OBJECT_UPDATED	(WM_APP + 1)	// lparam: 通知を受けた時刻(GetTickCount64の下位)
+#define WM_APP_OBJECT_UPDATED	(WM_APP + 1)
 #define WM_APP_SCENE_CHANGED	(WM_APP + 2)
 #define WM_APP_PROJECT_LOADED	(WM_APP + 3)
-#define WM_APP_RELEASED			(WM_APP + 4)	// マウスのボタン解放後、本体が解放を処理し終えてから取るため
 #define WM_APP_INIT				(WM_APP + 5)
 #define WM_APP_JUMP_KEEP		(WM_APP + 6)	// クリックで戻している間、投げたメッセージを絶やさずユーザーの入力を後回しにする
-#define WM_APP_GROUP_COMMAND	(WM_APP + 7)	// グループ化・グループ解除のコマンドを本体が処理し終えてから確かめるため
-#define WM_APP_EXTERNAL_FINISHED	(WM_APP + 8)	// Keychain to Transformの操作が終わった (wparam: 操作の結果)
 
 #define TIMER_ID_JUMP_TIMEOUT	1
 #define TIMER_ID_BUSY			2		// 戻している途中の表示を回す
-#define TIMER_ID_UNNOTIFIED		3		// 観測したUndo/Redoに通知が来ないか確かめる
 #define TIMER_ID_INIT			4		// 初期化の時にメインウィンドウ・メニューがまだ無ければ、少し待ってもう一度試す
+#define TIMER_ID_POLL			5		// 通知の来ない変化(グループ化等)に備えて、本体の履歴を定期的に確かめる
 #define INIT_RETRY_MS			100
-#define UNNOTIFIED_WAIT_MS		200		// 観測したUndo/Redoに、この時間通知が来なければプロジェクトファイルを読んで確かめる
+#define POLL_INTERVAL_MS		100
 #define BUSY_INTERVAL_MS		80
 #define BUSY_DOTS				8		// ぐるぐるマークの点の数
-#define JUMP_TIMEOUT_MS			10000	// クリックで戻す途中、送ったコマンドの通知がこの時間来なければ中止する (重い編集では1回の処理に時間がかかる)
-#define JUMP_KEEP_MAX_MS		3000	// 送ったコマンドの通知がこの時間来なければ、入力を後回しにするメッセージを投げるのをやめる
-#define COMMAND_EXPIRE_MS		500		// 観測したUndo/Redoのコマンドは、この時間内に通知が来なければ捨てる
-#define HISTORY_MAX				100		// 本体のUndoの上限と同じ
+#define JUMP_TIMEOUT_MS			10000	// クリックで戻す途中、送ったコマンドで本体の履歴がこの時間変わらなければ中止する (重い編集では1回の処理に時間がかかる)
+#define JUMP_KEEP_MAX_MS		3000	// 送ったコマンドで本体の履歴がこの時間変わらなければ、入力を後回しにするメッセージを投げるのをやめる
 #define LABEL_VALUE_MAX			24		// ラベルに出す値の最大文字数
-#define INPUT_KEY_WINDOW_MS		1000	// 数値欄への入力とみなす、キー入力から通知までの時間
-#define INPUT_CLOSE_GRACE_MS	200		// 入力を区切った後も、確定の通知を同じ項目にまとめる時間
 
 EDIT_HANDLE* edit_handle = nullptr;
 LOG_HANDLE* logger = nullptr;
@@ -69,10 +58,11 @@ CONFIG_HANDLE* config = nullptr;
 HWND g_hwnd = nullptr;
 HWND g_list = nullptr;
 HFONT g_font = nullptr;
+HFONT g_font_strike = nullptr;	// 取り消し線付き (テキストの消えた文字)
 
 COMMON_PLUGIN_TABLE common_plugin_table = {
 	PLUGIN_NAME,
-	L"EditHistory version 0.2 By teruyoshi",
+	L"EditHistory version 1.0 By teruyoshi",
 };
 
 EXTERN_C __declspec(dllexport) void InitializeLogger(LOG_HANDLE* handle) {
@@ -97,115 +87,53 @@ std::wstring utf8_to_wide(const std::string& s) {
 	return w;
 }
 
-// FNV-1a 64bit
-uint64_t hash_bytes(const void* data, size_t size, uint64_t h = 1469598103934665603ULL) {
-	const unsigned char* p = (const unsigned char*)data;
-	for (size_t i = 0; i < size; i++) {
-		h ^= p[i];
-		h *= 1099511628211ULL;
-	}
-	return h;
-}
-
-//=======================================================================
-//	状態 (シーンの全オブジェクトとレイヤー)
-//=======================================================================
-
-struct ObjState {
-	OBJECT_LAYER_FRAME lf = {};
-	std::string alias;
-	uint64_t alias_hash = 0;
-	int group = 0;	// オブジェクトのグループ化(Ctrl+G)の番号 (0:無し)。プロジェクトファイルからしか読めない
-};
-
-bool same_lf(const OBJECT_LAYER_FRAME& a, const OBJECT_LAYER_FRAME& b) {
-	return a.layer == b.layer && a.start == b.start && a.end == b.end;
-}
-
-// レイヤーの状態 (名前は標準の名前なら空)
-struct LayerState {
-	std::wstring name;
-	bool enable = true;
-	bool lock = false;
-	bool is_default() const { return name.empty() && enable && !lock; }
-	bool operator==(const LayerState& o) const { return name == o.name && enable == o.enable && lock == o.lock; }
-	bool operator!=(const LayerState& o) const { return !(*this == o); }
-};
-
-// レイヤー設定(座標・音量等)。プロジェクトファイルの[layer.N]セクションの項目 (標準と違う項目だけが書かれる)
-using LayerSettings = std::map<std::string, std::string>;
-
-struct State {
-	std::map<OBJECT_HANDLE, ObjState> objects;
-	std::map<int, LayerState> layers;	// 標準から変更されているレイヤーだけ
-	std::map<int, LayerSettings> layer_settings;	// レイヤー設定のあるレイヤーだけ
-};
-
-// 状態全体のハッシュ。ハンドルが変わっても内容が同じなら同じ値になるよう、レイヤー・開始フレーム順に並べて計算する
-uint64_t state_hash(const State& state) {
-	std::vector<std::pair<std::pair<int, int>, const ObjState*>> sorted;
-	for (auto& [h, o] : state.objects) sorted.push_back({ { o.lf.layer, o.lf.start }, &o });
-	std::sort(sorted.begin(), sorted.end(), [](auto& a, auto& b) { return a.first < b.first; });
-	uint64_t hash = 1469598103934665603ULL;
-	std::map<int, int> group_order;	// グループの番号は付け直されることがあるので、並び順で最初に現れた順の番号にする
-	for (auto& [key, o] : sorted) {
-		hash = hash_bytes(&o->lf, sizeof(o->lf), hash);
-		hash = hash_bytes(&o->alias_hash, sizeof(o->alias_hash), hash);
-		int group = 0;
-		if (o->group) {
-			auto it = group_order.find(o->group);
-			group = it != group_order.end() ? it->second : (group_order[o->group] = (int)group_order.size() + 1);
-		}
-		hash = hash_bytes(&group, sizeof(group), hash);
-	}
-	for (auto& [layer, s] : state.layers) {
-		hash = hash_bytes(&layer, sizeof(layer), hash);
-		hash = hash_bytes(s.name.data(), s.name.size() * sizeof(wchar_t), hash);
-		unsigned char flags = (s.enable ? 1 : 0) | (s.lock ? 2 : 0);
-		hash = hash_bytes(&flags, sizeof(flags), hash);
-	}
-	for (auto& [layer, settings] : state.layer_settings) {
-		hash = hash_bytes(&layer, sizeof(layer), hash);
-		for (auto& [key, value] : settings) {
-			std::string line = key + "=" + value + "\n";
-			hash = hash_bytes(line.data(), line.size(), hash);
-		}
-	}
-	return hash;
+std::string wide_to_utf8(const std::wstring& w) {
+	if (w.empty()) return "";
+	int len = WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+	std::string s(len, '\0');
+	WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), s.data(), len, nullptr, nullptr);
+	return s;
 }
 
 //=======================================================================
 //	履歴 (本体のUndoスタックの写し、シーンごと)
 //=======================================================================
 
+// 設定項目の値の変化
+enum { VALUE_NUMBER, VALUE_OTHER, VALUE_COLOR_LIST };
+struct ValueChange {
+	std::wstring item;					// 「グループの最初の項目名\x1f項目名」
+	std::string before, after;			// 数値・選択等: エイリアスと同じ書式のUTF-8 (選択等で変更前が分からなければ空) / 色リスト: encode_color_list()
+	int kind = VALUE_NUMBER;
+	std::vector<std::wstring> names;	// 色リストの色の名前 (開始色・中間色1…)
+	std::string merge_sub;				// まとめる判定に加える区別 (色リスト: 変わった色の番号と、色か位置か)
+};
+
 struct Entry {
-	uint64_t hash = 0;
 	std::wstring label;
-	std::vector<OBJECT_HANDLE> objects;	// この編集で変わったオブジェクト (Undo/Redo時に読み直す対象)
-	OBJECT_HANDLE text_object = nullptr;	// 文字列の項目への入力・時間制御の編集なら対象のオブジェクト (表示上まとめる)
-	std::string text_item;					// 文字列の項目への入力なら「セクション名\x1fエフェクト名\x1f項目名」、
-											// 時間制御の編集なら「\x1eセクション名\x1fエフェクト名\x1f項目名,…」
-											// (同じ項目の入力・編集だけをまとめる)
-											// 同じ数値項目の変更なら「\x1dセクション名\x1f項目名…」、位置の変更なら「\x1c移動」「\x1c長さ」
-	// 1つのオブジェクトだけの変更なら、その変更前後の状態 (まとめた行の説明を、最初の変更前→最後の変更後で作り直すため)
-	bool has_change = false;
-	ObjState change_before, change_after;
-	// 1つのレイヤーの1つのレイヤー設定だけの変更なら「レイヤーN 項目 」と変更前後の値 (まとめた行の説明を作り直すため)
-	std::wstring setting_prefix, setting_before, setting_after;
-	// 数値欄へのキーボード入力の途中なら、対象の設定項目と入力前の値 (確定まで同じ項目を上書きする)
-	OBJECT_HANDLE input_object = nullptr;
-	std::string input_effect, input_key, input_before;
-	int input_session = -1;
-	// 入力を始めた時に捨てた「やり直せる分」。入力は確定するまで本体の履歴に積まれず本体のやり直せる分も残っているので、
-	// 入力した結果が入力前と同じ状態に戻った時に元へ戻す (本体ではEscもEnterと同じく入力中の値で確定する)
-	std::vector<Entry> stashed_future;
+	// 本体のUndoの段の項目(UndoItem*)の並び。本体の履歴と照らし合わせる目印 (開始時点は空)
+	std::vector<uintptr_t> items;
+	// 同じ対象への同じ種類の変更が続く行を、一覧で1行にまとめるための情報
+	//   merge_key: 「\x1f…」文字列の項目への入力 / 「\x1e…」時間制御の編集 (最後の行の説明を出す)
+	//              「\x1d…」数値・選択・色リスト等の値 / 「\x1c移動」「\x1c長さ」位置 / 「\x1b…」レイヤー設定 (最初の変更前→最後の変更後で説明し直す)
+	uintptr_t merge_object = 0;		// 対象 (オブジェクト。レイヤー設定はレイヤー番号+1)
+	std::string merge_key;
+	std::wstring merge_prefix;		// 説明し直す時の頭 (「図形[L1] 標準描画 」等)
+	std::vector<ValueChange> values;	// 説明し直す時の変更前後の値 (位置は「レイヤー,開始,終了」)
+	// テキストの入力 (一覧で、増えた文字を緑、消えた文字を取り消し線付きの赤で描くための情報)
+	bool has_text = false;
+	std::wstring text_head;				// 「テキスト[L1] テキスト」等 (「入力 (」の前)
+	bool text_full_known = false;		// 入力後の全文が分かっているか (最新の段の時だけSDKで読める)
+	std::wstring text_after;			// 入力後の全文
+	int text_pos = 0;					// 削除・挿入した位置
+	std::wstring text_inserted, text_removed;
 };
 
 struct SceneHistory {
-	std::vector<Entry> entries;	// entries[0]は開始時点
+	std::vector<Entry> entries;	// entries[0]は開始時点、entries[1..]は本体のUndoの段(古い順)
 	int pos = 0;
-	State state;
 	bool initialized = false;
+	uintptr_t hist = 0;			// 対応する本体の履歴(History*)
 };
 
 std::map<int, SceneHistory> g_scenes;
@@ -220,39 +148,8 @@ SceneHistory& current_history() { return g_scenes[g_scene_id]; }
 void update_list();
 
 //=======================================================================
-//	エイリアスの差分からラベルを作る
+//	説明の文字列
 //=======================================================================
-
-// エイリアスを「セクション名 → (キー, 値)の並び」に分解する
-struct AliasSection {
-	std::string name;
-	std::vector<std::pair<std::string, std::string>> items;
-};
-
-std::vector<AliasSection> parse_alias(const std::string& alias) {
-	std::vector<AliasSection> sections;
-	size_t pos = 0;
-	while (pos < alias.size()) {
-		size_t end = alias.find('\n', pos);
-		if (end == std::string::npos) end = alias.size();
-		std::string line = alias.substr(pos, end - pos);
-		if (!line.empty() && line.back() == '\r') line.pop_back();
-		pos = end + 1;
-		if (line.empty()) continue;
-		if (line.front() == '[' && line.back() == ']') {
-			sections.push_back({ line.substr(1, line.size() - 2), {} });
-		} else if (!sections.empty()) {
-			size_t eq = line.find('=');
-			if (eq != std::string::npos) sections.back().items.push_back({ line.substr(0, eq), line.substr(eq + 1) });
-		}
-	}
-	return sections;
-}
-
-std::string section_value(const AliasSection& s, const char* key) {
-	for (auto& [k, v] : s.items) if (k == key) return v;
-	return "";
-}
 
 std::wstring shorten(const std::wstring& s) {
 	std::wstring t;
@@ -261,19 +158,15 @@ std::wstring shorten(const std::wstring& s) {
 	return t;
 }
 
-// オブジェクトの表示名 (名前が付いていればその名前、無ければ最初のエフェクト名) と [Lレイヤー]
-std::wstring object_title(const ObjState& o) {
-	auto sections = parse_alias(o.alias);
-	std::string name;
-	for (auto& s : sections) {
-		if (s.name == "Object") name = section_value(s, "name");
-	}
-	if (name.empty()) {
-		for (auto& s : sections) {
-			if (s.name.rfind("Object.", 0) == 0) { name = section_value(s, "effect.name"); break; }
-		}
-	}
-	return utf8_to_wide(name.empty() ? "オブジェクト" : name) + L"[L" + std::to_wstring(o.lf.layer + 1) + L"]";
+// フレーム番号を時刻の文字列にする (60秒未満は「1.23秒」、以上は「1:05.20」)
+int g_rate = 60, g_scale = 1;	// ラベルを作る時点のシーンのフレームレート
+
+std::wstring time_text(int frame) {
+	double sec = g_rate > 0 ? (double)frame * g_scale / g_rate : 0;
+	wchar_t buf[32];
+	if (sec < 60) swprintf_s(buf, L"%.2f秒", sec);
+	else swprintf_s(buf, L"%d:%05.2f", (int)(sec / 60), sec - (int)(sec / 60) * 60);
+	return buf;
 }
 
 bool is_numeric_value(const std::string& v) {
@@ -282,18 +175,14 @@ bool is_numeric_value(const std::string& v) {
 	return true;
 }
 
-// トラックバーの設定値。エイリアスでは次の形になる (プロジェクトファイルで確認)
-//   移動無し: 「100.00」
-//   移動あり: 「開始値,(中間点の値…,)終了値,移動方法,設定」 例:「0.00,10000.00,直線移動,0」
-//   時間制御等: 上の後ろに「|データ」 例:「0.00,16.63,直線移動(時間制御),0|0.238636,0.488024,…」
-//   参照式: 設定の8のビットが立ち、「|」の直後が式 例:「0.00,移動無し,8|X*2+5」「440.50,451.50,直線移動,8|layer35.Z軸回転-角度」
-//   (設定はビットの組で、4は移動方法の設定データあり。12=8+4では「…,12|式|移動方法の設定|時間制御のデータ」の順に並ぶ)
+// トラックバーの値の文字列 (エイリアスと同じ書式。メモリから読んだ値をこの書式にしてから比べる)
+//   移動無し: 「100.00」 / 移動あり: 「開始値,(中間点の値…,)終了値,移動方法,設定」 / 参照式: 設定の8のビットが立ち「|」の後ろが式
 #define TRACK_PARAM_EXPRESSION	8
 
 struct TrackValue {
 	bool track = false;					// 移動方法が付いているか
 	std::vector<std::string> values;	// 値の並び
-	std::string move, extra;			// 移動方法、「|」の後ろ (参照式を除く)
+	std::string move;					// 移動方法
 	int param = 0;						// 設定 (ビットの組)
 	bool has_expression = false;
 	std::string expression;				// 参照式
@@ -303,7 +192,6 @@ TrackValue parse_track(const std::string& v) {
 	TrackValue t;
 	size_t bar = v.find('|');
 	std::string main = v.substr(0, bar);
-	if (bar != std::string::npos) t.extra = v.substr(bar + 1);
 	std::vector<std::string> tokens;
 	size_t pos = 0;
 	while (true) {
@@ -315,7 +203,6 @@ TrackValue parse_track(const std::string& v) {
 	size_t k = 0;
 	while (k < tokens.size() && is_numeric_value(tokens[k])) k++;
 	if (k == 0 || k == tokens.size()) {
-		// 数値で始まらない(文字列等)か、全て数値(移動無し)
 		t.values = { main };
 		return t;
 	}
@@ -325,9 +212,7 @@ TrackValue parse_track(const std::string& v) {
 	if (k + 1 < tokens.size()) t.param = atoi(tokens[k + 1].c_str());
 	if ((t.param & TRACK_PARAM_EXPRESSION) && bar != std::string::npos) {
 		t.has_expression = true;
-		size_t next = t.extra.find('|');
-		t.expression = t.extra.substr(0, next);
-		t.extra = next == std::string::npos ? "" : t.extra.substr(next + 1);
+		t.expression = v.substr(bar + 1);
 	}
 	return t;
 }
@@ -372,673 +257,84 @@ std::wstring describe_value_change(const std::string& old_value, const std::stri
 			}
 			return L" " + shorten(utf8_to_wide(track_value_text(old_value))) + L"→" + shorten(utf8_to_wide(track_value_text(value)));
 		}
-		// 時間制御のカーブ等は内容まで追わない
-		if (a.extra != b.extra && b.move.find("時間制御") != std::string::npos) return L" の時間制御を編集";
+		// 値・移動方法・設定・参照式が同じで項目が変わった: 時間制御のカーブや移動方法の設定値 (内容までは追わない)
+		if (b.move.find("時間制御") != std::string::npos) return L" の時間制御を編集";
 		return L" の移動方法の設定を変更";
 	}
 	return L" " + shorten(utf8_to_wide(old_value)) + L"→" + shorten(utf8_to_wide(value));
 }
 
-// エフェクトの設定項目の種別 (EFFECT_ITEM_TYPE_*、分からなければ0)。enum_effect_itemで調べた結果を覚えておく
-int effect_item_type(const std::string& effect, const std::string& key) {
-	static std::map<std::pair<std::string, std::string>, int> cache;
-	auto cache_key = std::make_pair(effect, key);
-	auto it = cache.find(cache_key);
-	if (it != cache.end()) return it->second;
-	struct Param { std::wstring name; int type; } param = { utf8_to_wide(key), 0 };
-	if (edit_handle && !effect.empty()) {
-		edit_handle->enum_effect_item(utf8_to_wide(effect).c_str(), &param, [](void* p, LPCWSTR name, int type) {
-			auto* q = (Param*)p;
-			if (q->name == name) q->type = type;
-		});
-	}
-	cache[cache_key] = param.type;
-	return param.type;
-}
-
-// 文字列の設定項目か (テキストオブジェクトのテキスト、スクリプトのテキスト・文字列項目、スクリプト制御等)
-// 本体はこれらへの入力で1文字ずつUndoを積む (ユーザー確認済み)
-bool is_text_item(const std::string& effect, const std::string& key) {
-	if (effect == "テキスト" && key == "テキスト") return true;
-	int type = effect_item_type(effect, key);
-	return type == EDIT_HANDLE::EFFECT_ITEM_TYPE_TEXT || type == EDIT_HANDLE::EFFECT_ITEM_TYPE_STRING;
-}
-
-// [Object]セクションのレイヤー・フレーム以外の変化を説明する。キーはプロジェクトファイルで確認した:
-//   clipping=1: クリッピング / clipping.upper=1: 上のオブジェクトでクリッピング (無い時は無効)
-//   camera=0: カメラ制御の対象外 / group.control=0: グループ制御の対象外 (無い時は対象)
-//   name=: オブジェクト名
-std::vector<std::wstring> describe_object_section_change(const AliasSection& a, const AliasSection& b) {
-	struct Flag { const char* key; const char* fallback; const wchar_t* on; const wchar_t* off; };
-	static const Flag flags[] = {
-		{ "clipping", "0", L"のクリッピングを有効化", L"のクリッピングを解除" },
-		{ "clipping.upper", "0", L"の上のオブジェクトでクリッピングを有効化", L"の上のオブジェクトでクリッピングを解除" },
-		{ "camera", "1", L"をカメラ制御の対象にする", L"をカメラ制御の対象から外す" },
-		{ "group.control", "1", L"をグループ制御の対象にする", L"をグループ制御の対象から外す" },
-	};
-	auto value_of = [](const AliasSection& s, const std::string& key, bool& found) -> std::string {
-		for (auto& [k, v] : s.items) if (k == key) { found = true; return v; }
-		found = false;
-		return "";
-	};
-	std::vector<std::string> keys;
-	for (auto* s : { &a, &b }) {
-		for (auto& [k, v] : s->items) {
-			if (k == "layer" || k == "frame" || k == "focus") continue;
-			if (std::find(keys.begin(), keys.end(), k) == keys.end()) keys.push_back(k);
-		}
-	}
-	std::vector<std::wstring> texts;
-	for (auto& key : keys) {
-		bool found_a = false, found_b = false;
-		std::string va = value_of(a, key, found_a), vb = value_of(b, key, found_b);
-		const Flag* flag = nullptr;
-		for (auto& f : flags) if (key == f.key) flag = &f;
-		if (flag) {
-			if (!found_a) va = flag->fallback;
-			if (!found_b) vb = flag->fallback;
-			if (va != vb) texts.push_back(vb != "0" ? flag->on : flag->off);
-		} else if (key == "name") {
-			if (va != vb) {
-				texts.push_back(L"の名前を変更 (" + (va.empty() ? L"なし" : shorten(utf8_to_wide(va))) + L"→" +
-					(vb.empty() ? L"なし" : shorten(utf8_to_wide(vb))) + L")");
-			}
-		} else if (found_a != found_b || va != vb) {
-			// 未確認のキーはそのまま出す
-			texts.push_back(utf8_to_wide(key) + L" " + (found_a ? shorten(utf8_to_wide(va)) : L"なし") + L"→" +
-				(found_b ? shorten(utf8_to_wide(vb)) : L"なし"));
-		}
-	}
-	return texts;
-}
-
 // 並びのi番目のエフェクトの表示名。同じエフェクトが複数ある時は「ぼかし[2]」のように上から何番目か(1から)を付ける
-std::string effect_display_name(const std::vector<std::string>& names, size_t i) {
+std::wstring effect_display_name(const std::vector<std::wstring>& names, size_t i) {
+	if (i >= names.size()) return L"エフェクト";
 	int total = 0, order = 0;
 	for (size_t j = 0; j < names.size(); j++) {
 		if (names[j] != names[i]) continue;
 		total++;
 		if (j <= i) order++;
 	}
-	return total > 1 ? names[i] + "[" + std::to_string(order) + "]" : names[i];
+	return total > 1 ? names[i] + L"[" + std::to_wstring(order) + L"]" : names[i];
 }
 
-// セクション名 → 表示用のエフェクト名
-std::map<std::string, std::string> effect_display_names(const std::vector<AliasSection>& sections) {
-	std::vector<std::string> names, section_names;
-	for (auto& s : sections) {
-		if (s.name == "Object") continue;
-		names.push_back(section_value(s, "effect.name"));
-		section_names.push_back(s.name);
-	}
-	std::map<std::string, std::string> result;
-	for (size_t i = 0; i < names.size(); i++) result[section_names[i]] = effect_display_name(names, i);
-	return result;
-}
-
-// エフェクトの順番の変更・追加・削除を説明する (いずれでもなければ空)。
-// セクション名は並び順の番号なので、順番を変えると同じ番号のセクションのエフェクトが入れ替わって見える
-std::wstring describe_effect_reorder(const std::vector<AliasSection>& a, const std::vector<AliasSection>& b) {
-	std::vector<std::string> na, nb;
-	for (auto& s : a) if (s.name != "Object") na.push_back(section_value(s, "effect.name"));
-	for (auto& s : b) if (s.name != "Object") nb.push_back(section_value(s, "effect.name"));
-	// 途中のエフェクトの追加・削除も、それより下のセクションの番号がずれて別のエフェクトに変わったように見えるので、並びで見分ける
-	// (多い方の並びから1つ抜くと少ない方と一致すれば、それを追加・削除したとみなす)
+// エフェクトの順番の変更・追加・削除・種類の変更を説明する (いずれでもなければ空)
+std::wstring describe_effect_list_change(const std::vector<std::wstring>& na, const std::vector<std::wstring>& nb) {
+	// 多い方の並びから1つ抜くと少ない方と一致すれば、それを追加・削除したとみなす
 	if (na.size() + 1 == nb.size() || nb.size() + 1 == na.size()) {
 		const auto& longer = na.size() > nb.size() ? na : nb;
 		const auto& shorter = na.size() > nb.size() ? nb : na;
-		for (size_t i = 0; i < longer.size(); i++) {
-			std::vector<std::string> r = longer;
+		// 同じ名前のエフェクトが並ぶ時はどれでも一致するので、後ろから探す (追加は普通末尾に入る)
+		for (size_t i = longer.size(); i-- > 0;) {
+			std::vector<std::wstring> r = longer;
 			r.erase(r.begin() + i);
-			if (r == shorter) return utf8_to_wide(effect_display_name(longer, i)) + (nb.size() > na.size() ? L" を追加" : L" を削除");
+			if (r == shorter) return effect_display_name(longer, i) + (nb.size() > na.size() ? L" を追加" : L" を削除");
 		}
-		return L"";
+		return nb.size() > na.size() ? L"エフェクトを追加" : L"エフェクトを削除";
 	}
-	if (na.size() != nb.size() || na == nb) return L"";
-	std::vector<std::string> sa = na, sb = nb;
+	if (na.size() != nb.size()) return nb.size() > na.size() ? L"エフェクトを追加" : L"エフェクトを削除";
+	if (na == nb) return L"";
+	std::vector<std::wstring> sa = na, sb = nb;
 	std::sort(sa.begin(), sa.end());
 	std::sort(sb.begin(), sb.end());
-	if (sa != sb) return L"";
+	if (sa != sb) {
+		// 1つだけ違う: エフェクトの種類の変更
+		std::vector<size_t> diffs;
+		for (size_t i = 0; i < na.size(); i++) if (na[i] != nb[i]) diffs.push_back(i);
+		if (diffs.size() == 1) return effect_display_name(na, diffs[0]) + L" を " + effect_display_name(nb, diffs[0]) + L" に変更";
+		return L"エフェクトを変更";
+	}
 	// 動かしたエフェクトの候補: 前後の並びから1つずつ抜くと残りが一致するもの (変更前の並びの位置)
 	std::vector<size_t> moved;
 	for (size_t i = 0; i < na.size(); i++) {
-		std::vector<std::string> ra = na;
+		std::vector<std::wstring> ra = na;
 		ra.erase(ra.begin() + i);
 		for (size_t j = 0; j < nb.size(); j++) {
 			if (nb[j] != na[i]) continue;
-			std::vector<std::string> rb = nb;
+			std::vector<std::wstring> rb = nb;
 			rb.erase(rb.begin() + j);
 			if (ra == rb) { moved.push_back(i); break; }
 		}
 	}
-	if (moved.size() == 1) return utf8_to_wide(effect_display_name(na, moved[0])) + L" の順番を変更";
+	if (moved.size() == 1) return effect_display_name(na, moved[0]) + L" の順番を変更";
 	// 隣どうしの入れ替えは、どちらを動かしたか分からない
-	if (moved.size() == 2) {
-		return utf8_to_wide(effect_display_name(na, moved[0])) + L" と " + utf8_to_wide(effect_display_name(na, moved[1])) + L" を入れ替え";
-	}
+	if (moved.size() == 2) return effect_display_name(na, moved[0]) + L" と " + effect_display_name(na, moved[1]) + L" を入れ替え";
 	return L"エフェクトの順番を変更";
 }
 
-// 同じオブジェクトの変更前後のエイリアスを比べ、変わった設定項目を1つ説明する。
-// text_item: 変わったのが1つの文字列の項目だけなら「セクション名\x1fエフェクト名\x1f項目名」、それ以外は空
-std::wstring describe_content_change(const ObjState& before, const ObjState& after, std::string& text_item) {
-	text_item.clear();
-	auto a = parse_alias(before.alias);
-	auto b = parse_alias(after.alias);
-	std::wstring reorder = describe_effect_reorder(a, b);
-	if (!reorder.empty()) return reorder;
-	// 表示用のエフェクト名 (同じエフェクトが複数ある時は「ぼかし[2]」)。まとめる判定にはセクション名(並び順の番号)も使う
-	auto names_a = effect_display_names(a);
-	auto names_b = effect_display_names(b);
-	std::vector<std::wstring> changes;
-	bool only_text = true;
-	int text_count = 0;
-	std::string text_candidate;
-	int lock_on = 0, lock_off = 0;	// ロックだけが変わったエフェクトの数
-	int hide_on = 0, hide_off = 0;	// 表示/非表示(effect.disable)だけが変わったエフェクトの数
-	bool hide_first = false;		// 最初のエフェクト(オブジェクト本体)の表示/非表示が変わったか
-	int effect_index = 0;			// 何番目のエフェクトか (新しく追加されたもの・種類が変わったものを除く)
-	int timectl_count = 0;			// 時間制御の編集だけが変わったエフェクトの数
-	std::string timectl_keys, timectl_candidate;
-	for (size_t i = 0; i < b.size(); i++) {
-		const AliasSection* old_section = nullptr;
-		for (auto& s : a) if (s.name == b[i].name) { old_section = &s; break; }
-		if (!old_section) {
-			std::string effect = names_b[b[i].name];
-			changes.push_back(utf8_to_wide(effect.empty() ? b[i].name : effect) + L" を追加");
-			only_text = false;
-			continue;
-		}
-		if (b[i].name == "Object") {
-			// レイヤー・フレームは位置の変化として別に扱う。それ以外(クリッピング・名前等)をここで説明する
-			for (auto& text : describe_object_section_change(*old_section, b[i])) changes.push_back(text);
-			if (!changes.empty()) only_text = false;
-			continue;
-		}
-		std::string effect = section_value(b[i], "effect.name");
-		std::string old_effect = section_value(*old_section, "effect.name");
-		std::string label = names_b[b[i].name];	// 表示用の名前
-		if (effect != old_effect) {
-			changes.push_back(utf8_to_wide(names_a[old_section->name]) + L" を " + utf8_to_wide(label) + L" に変更");
-			only_text = false;
-			continue;
-		}
-		std::vector<std::pair<std::wstring, std::wstring>> items;	// このエフェクトで変わった項目名と説明 (プレビューでX,Yを同時に動かした等)
-		// 変わった項目 (項目名, 変更前, 変更後)。ロック等は無効にするとキーごと消えるので、変更前にだけある項目も含める
-		std::vector<std::tuple<std::string, std::string, std::string>> item_changes;
-		for (auto& [key, value] : b[i].items) {
-			std::string old_value;
-			bool found = false;
-			for (auto& [k, v] : old_section->items) if (k == key) { old_value = v; found = true; break; }
-			if (!found || old_value != value) item_changes.push_back({ key, old_value, value });
-		}
-		for (auto& [key, old_value] : old_section->items) {
-			bool exists = false;
-			for (auto& [k, v] : b[i].items) if (k == key) { exists = true; break; }
-			if (!exists) item_changes.push_back({ key, old_value, "" });
-		}
-		if (item_changes.size() == 1 && std::get<0>(item_changes[0]) == "display.lock") {
-			const std::string& v = std::get<2>(item_changes[0]);
-			((!v.empty() && v != "0") ? lock_on : lock_off)++;
-		}
-		if (item_changes.size() == 1 && std::get<0>(item_changes[0]) == "effect.disable") {
-			const std::string& v = std::get<2>(item_changes[0]);
-			((!v.empty() && v != "0") ? hide_on : hide_off)++;
-			if (effect_index == 0) hide_first = true;
-		}
-		effect_index++;
-		for (auto& [key, old_value, value] : item_changes) {
-			if (key == "display.lock") {
-				// エフェクト(オブジェクトの最初のエフェクトならオブジェクト)のロック。無効の時はキーが無い
-				items.push_back({ L"", (!value.empty() && value != "0") ? L"をロック" : L"のロックを解除" });
-				only_text = false;
-			} else if (key == "effect.disable") {
-				// エフェクトのチェックを外す(非表示)と1、付ける(表示)とキーが無くなる
-				items.push_back({ L"", (!value.empty() && value != "0") ? L"を非表示" : L"を表示" });
-				only_text = false;
-			} else if (is_text_item(effect, key)) {
-				// 入力後の内容を出す (1文字ずつの項目を表示上まとめた行でも、最後の項目のラベルがそのまま使える)
-				std::wstring item = effect == "テキスト" && key == "テキスト" ? L"テキスト" :
-					(label.empty() ? L"" : utf8_to_wide(label) + L" ") + utf8_to_wide(key) + L" ";
-				changes.push_back(item + L"入力 (" + shorten(utf8_to_wide(value)) + L")");
-				text_count++;
-				text_candidate = b[i].name + "\x1f" + effect + "\x1f" + key;
-			} else {
-				// 移動方法の適用・時間制御の編集等、値を含まない同じ説明が続く時は「X,Y,Z に 直線移動 を適用」とまとめる
-				// (X,Y,Zのようにグループ化された項目は同時に変わるため)
-				std::wstring desc = describe_value_change(old_value, value);
-				bool merged = false;
-				if (desc.find(L'→') == std::wstring::npos) {
-					for (auto& [keys, d] : items) {
-						if (d == desc) { keys += L"," + utf8_to_wide(key); merged = true; break; }
-					}
-				}
-				if (!merged) items.push_back({ utf8_to_wide(key), desc });
-				only_text = false;
-				if (desc == L" の時間制御を編集") timectl_keys += key + ",";
-			}
-		}
-		// このエフェクトの変化が時間制御の編集だけなら、同じ項目の編集が続く行を表示上まとめるための候補にする
-		if (items.size() == 1 && items[0].second == L" の時間制御を編集") {
-			timectl_count++;
-			timectl_candidate = "\x1e" + b[i].name + "\x1f" + effect + "\x1f" + timectl_keys;
-		}
-		timectl_keys.clear();
-		if (!items.empty()) {
-			std::wstring text = label.empty() ? L"" : utf8_to_wide(label) + L" ";
-			for (size_t j = 0; j < items.size(); j++) text += (j ? L", " : L"") + items[j].first + items[j].second;
-			changes.push_back(text);
-		}
+// オブジェクトの位置
+struct ObjPos {
+	int layer = 0, start = 0, end = 0;
+	bool operator==(const ObjPos& o) const { return layer == o.layer && start == o.start && end == o.end; }
+	bool operator!=(const ObjPos& o) const { return !(*this == o); }
+	std::string text() const { return std::to_string(layer) + "," + std::to_string(start) + "," + std::to_string(end); }
+	static ObjPos parse(const std::string& s) {
+		ObjPos p;
+		sscanf_s(s.c_str(), "%d,%d,%d", &p.layer, &p.start, &p.end);
+		return p;
 	}
-	for (auto& s : a) {
-		bool exists = false;
-		for (auto& t : b) if (t.name == s.name) { exists = true; break; }
-		if (!exists) {
-			std::string effect = names_a[s.name];
-			changes.push_back(utf8_to_wide(effect.empty() ? s.name : effect) + L" を削除");
-			only_text = false;
-		}
-	}
-	if (changes.empty()) return L"を変更";
-	// オブジェクト自体のロックは、オブジェクト本体(最初のエフェクト)と標準描画等のdisplay.lockが一度に変わる
-	// (追加エフェクトは変わらない。プロジェクトファイルで確認)。エフェクトを個別にロックする操作では1つしか変わらないので、
-	// 2つ以上のエフェクトのロックだけが同じ向きに変わったら、オブジェクトのロックとして1件にする
-	if (lock_on + lock_off >= 2 && (int)changes.size() == lock_on + lock_off && (lock_on == 0 || lock_off == 0)) {
-		return lock_on ? L"をロック" : L"のロックを解除";
-	}
-	// オブジェクト本体(最初のエフェクト)の表示/非表示、または複数のエフェクトが一度に変わった場合はオブジェクトの表示/非表示とする
-	if ((hide_first || hide_on + hide_off >= 2) && (int)changes.size() == hide_on + hide_off && (hide_on == 0 || hide_off == 0)) {
-		return hide_on ? L"を非表示" : L"を表示";
-	}
-	if (only_text && text_count == 1 && changes.size() == 1) text_item = text_candidate;
-	// 同じ項目の時間制御の編集が続く時も、テキストの入力と同じく表示上まとめる (本体は編集ごとにUndoを積む)
-	if (timectl_count == 1 && changes.size() == 1) text_item = timectl_candidate;
-	std::wstring text = changes[0];
-	if (changes.size() > 1) text += L" 他" + std::to_wstring(changes.size() - 1) + L"件";
-	return text;
-}
-
-//=======================================================================
-//	状態の読み取り
-//=======================================================================
-
-struct ObjChange {
-	OBJECT_HANDLE handle = nullptr;
-	bool added = false, removed = false, moved = false, content = false;
-	ObjState before, after;
 };
-
-struct LayerChange {
-	int layer = 0;
-	LayerState before, after;
-};
-
-struct LayerSettingChange {
-	int layer = 0;
-	LayerSettings before, after;
-};
-
-struct GroupChange {
-	OBJECT_HANDLE handle = nullptr;
-	int before = 0, after = 0;
-};
-
-struct Refresh {
-	bool ok = false;
-	std::vector<ObjChange> objects;
-	std::vector<LayerChange> layers;
-	std::vector<LayerSettingChange> settings;
-	std::vector<GroupChange> groups;
-	bool empty() const { return objects.empty() && layers.empty() && settings.empty() && groups.empty(); }
-};
-
-//-----------------------------------------------------------------------
-//	プロジェクトファイルからしか読めないもの (レイヤー設定・オブジェクトのグループ化)
-//	・レイヤー設定: SDKに読む関数が無く、各オブジェクトのエイリアスにも現れないが、変更すると本体のUndoが積まれUPDATE_OBJECTも来る
-//	・グループ化(Ctrl+G): SDKに読む関数が無くエイリアスにも現れず、本体のUndoは積まれるがUPDATE_OBJECTも来ない
-//	プロジェクトを一時ファイルに保存(自動バックアップと同じ処理)して[layer.N]セクションと各オブジェクトのgroup=を読む。
-//	保存は重いので、一覧の右クリックのメニューで有効にした時だけ読む。読む時も、他で変化が見つからない時・全体を読み直す時・
-//	レイヤーの状態が変わった時・オブジェクトが増えた時・グループ化のコマンドや通知の来ないUndo/Redoを観測した時に限る
-//-----------------------------------------------------------------------
-
-bool g_track_layer_settings = true;	// レイヤー設定・グループ化の変更も記録するか (EditHistory.iniに保存する)
-// 変化の見つからない通知で、選択中・再生位置以外のオブジェクトの変更を探すために全オブジェクトを読み直すか (EditHistory.iniに保存する)。
-// エイリアスの取得は1個約0.8msかかるので、オブジェクトが多いと編集が重くなる。
-// 無効の時も、再生位置にあるオブジェクトは読み直す (プレビューでは選択していないオブジェクトもマウスで動かせるため)
-bool g_track_other_objects = true;
-
-// プロジェクトを一時ファイルに保存し、scene_idのシーンのレイヤー設定と、グループ化されたオブジェクトを読む (保存できなければfalse)
-// groups: (レイヤー, 開始フレーム) → グループの番号
-bool read_project_file(int scene_id, std::map<int, LayerSettings>& out, std::map<std::pair<int, int>, int>& groups) {
-	wchar_t dir[MAX_PATH];
-	DWORD length = GetTempPathW(MAX_PATH, dir);
-	if (length == 0 || length >= MAX_PATH) return false;
-	std::wstring path = std::wstring(dir) + L"EditHistory_" + std::to_wstring(GetCurrentProcessId()) + L".aup2";
-	if (!edit_handle->save_project_file(path.c_str())) return false;
-	std::string data;
-	{
-		std::ifstream file(path, std::ios::binary);
-		data.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
-	}
-	DeleteFileW(path.c_str());
-
-	// [scene.N]のscene=でシーンを見分け、そのシーンの[layer.N]と[オブジェクトの番号]を読む。
-	// [layer.N]のNは並び順の番号の可能性があるので、レイヤー番号は中のlayer=から取る。
-	// オブジェクトの[N]にはlayer=・frame=開始,(中間点,)終了・group=が書かれる
-	out.clear();
-	groups.clear();
-	bool in_scene_header = false, in_scene = false, in_layer = false, in_object = false;
-	int layer = -1, start = -1, group = 0;
-	LayerSettings settings;
-	auto commit = [&]() {
-		if (in_layer && layer >= 0 && !settings.empty()) out[layer] = settings;
-		if (in_object && layer >= 0 && start >= 0 && group) groups[{ layer, start }] = group;
-		in_layer = in_object = false;
-		layer = start = -1;
-		group = 0;
-		settings.clear();
-	};
-	size_t pos = 0;
-	while (pos < data.size()) {
-		size_t end = data.find('\n', pos);
-		if (end == std::string::npos) end = data.size();
-		std::string line = data.substr(pos, end - pos);
-		pos = end + 1;
-		if (!line.empty() && line.back() == '\r') line.pop_back();
-		if (line.empty()) continue;
-		if (line[0] == '[') {
-			commit();
-			in_scene_header = line.rfind("[scene.", 0) == 0;
-			if (in_scene_header) in_scene = false;
-			in_layer = in_scene && line.rfind("[layer.", 0) == 0;
-			in_object = in_scene && line.size() > 2 && line.back() == ']' &&
-				line.find_first_not_of("0123456789", 1) == line.size() - 1;
-			continue;
-		}
-		size_t eq = line.find('=');
-		if (eq == std::string::npos) continue;
-		std::string key = line.substr(0, eq), value = line.substr(eq + 1);
-		if (in_scene_header && key == "scene") in_scene = atoi(value.c_str()) == scene_id;
-		else if ((in_layer || in_object) && key == "layer") layer = atoi(value.c_str());
-		else if (in_layer) settings[key] = value;
-		else if (in_object && key == "frame") start = atoi(value.c_str());
-		else if (in_object && key == "group") group = atoi(value.c_str());
-	}
-	commit();
-	return true;
-}
-
-// レイヤー設定とグループ化を読み直し、変わったものをrに足す (記録しない設定の時・保存できない時は何もしない)
-void refresh_project_file(SceneHistory& sh, Refresh& r) {
-	if (!g_track_layer_settings) return;
-	std::map<int, LayerSettings> now;
-	std::map<std::pair<int, int>, int> groups;
-	if (!read_project_file(g_scene_id, now, groups)) return;
-	for (auto& [handle, o] : sh.state.objects) {
-		auto it = groups.find({ o.lf.layer, o.lf.start });
-		int group = it != groups.end() ? it->second : 0;
-		if (group != o.group) r.groups.push_back({ handle, o.group, group });
-		o.group = group;
-	}
-	std::set<int> layers;
-	for (auto& [layer, settings] : sh.state.layer_settings) layers.insert(layer);
-	for (auto& [layer, settings] : now) layers.insert(layer);
-	for (int layer : layers) {
-		auto a = sh.state.layer_settings.find(layer);
-		auto b = now.find(layer);
-		LayerSettings before = a != sh.state.layer_settings.end() ? a->second : LayerSettings();
-		LayerSettings after = b != now.end() ? b->second : LayerSettings();
-		if (before != after) r.settings.push_back({ layer, before, after });
-	}
-	sh.state.layer_settings = std::move(now);
-}
-
-// レイヤー設定の項目名の表示
-std::wstring layer_setting_name(const std::string& key) {
-	if (key == "x") return L"X";
-	if (key == "y") return L"Y";
-	if (key == "z") return L"Z";
-	if (key == "volume") return L"音量";
-	if (key == "balance") return L"左右";
-	return utf8_to_wide(key);
-}
-
-// レイヤー設定の値の表示 (書かれていなければ標準の値。数値は末尾の0を省く)
-std::wstring layer_setting_value(const LayerSettings& settings, const std::string& key) {
-	auto it = settings.find(key);
-	if (it == settings.end()) return L"標準";
-	std::string value = it->second;
-	char* end = nullptr;
-	strtod(value.c_str(), &end);
-	if (!value.empty() && end && *end == '\0' && value.find('.') != std::string::npos) {
-		while (value.back() == '0') value.pop_back();
-		if (value.back() == '.') value.pop_back();
-	}
-	return shorten(utf8_to_wide(value));
-}
-
-// エイリアスから選択状態(focus=)の行を除く。プロジェクトファイルでは[Object]セクションに選択中を表すfocus=1が入るため、
-// エイリアスにも入っていると選択が移っただけで変更と数えられ、状態のハッシュもずれてしまう
-std::string strip_focus(const std::string& alias) {
-	std::string out;
-	out.reserve(alias.size());
-	size_t pos = 0;
-	while (pos < alias.size()) {
-		size_t end = alias.find('\n', pos);
-		if (end == std::string::npos) end = alias.size();
-		if (alias.compare(pos, 6, "focus=") != 0) out.append(alias, pos, std::min(end + 1, alias.size()) - pos);
-		pos = end + 1;
-	}
-	return out;
-}
-
-// 状態を読み取ってキャッシュを更新し、変わったものを返す。
-// エイリアスの取得は1個約0.8msと重いので、full以外では次のオブジェクトだけ取り直す:
-//	位置が変わった・新しく現れたオブジェクト / 選択中のオブジェクト / candidatesに含まれるオブジェクト
-Refresh refresh_state(SceneHistory& sh, const std::set<OBJECT_HANDLE>& candidates, bool full) {
-	struct Param {
-		SceneHistory* sh;
-		const std::set<OBJECT_HANDLE>* candidates;
-		bool full;
-		EDIT_INFO info;
-		Refresh result;
-	} param = { &sh, &candidates, full, {}, {} };
-	edit_handle->get_edit_info(&param.info, sizeof(param.info));
-
-	param.result.ok = edit_handle->call_read_section_param(&param, [](void* p, EDIT_SECTION* edit) {
-		auto* param = (Param*)p;
-		State& state = param->sh->state;
-		Refresh& result = param->result;
-
-		std::set<OBJECT_HANDLE> selected;
-		if (OBJECT_HANDLE focus = edit->get_focus_object()) selected.insert(focus);
-		int num = edit->get_selected_object_num();
-		for (int i = 0; i < num; i++) selected.insert(edit->get_selected_object(i));
-
-		// 全オブジェクトの位置 (軽い)
-		std::map<OBJECT_HANDLE, OBJECT_LAYER_FRAME> positions;
-		for (int layer = 0; layer <= param->info.layer_max; layer++) {
-			int frame = 0;
-			while (OBJECT_HANDLE obj = edit->find_object(layer, frame)) {
-				OBJECT_LAYER_FRAME lf = edit->get_object_layer_frame(obj);
-				positions[obj] = lf;
-				if (lf.end + 1 <= frame) break;
-				frame = lf.end + 1;
-			}
-		}
-
-		for (auto& [h, lf] : positions) {
-			auto it = state.objects.find(h);
-			bool is_new = it == state.objects.end();
-			bool moved = !is_new && !same_lf(it->second.lf, lf);
-			bool need_alias = param->full || is_new || moved || selected.count(h) || param->candidates->count(h);
-			if (!need_alias) continue;
-			ObjState now;
-			now.lf = lf;
-			if (!is_new) now.group = it->second.group;	// グループはプロジェクトファイルからしか読めないので引き継ぐ
-			LPCSTR alias = edit->get_object_alias(h);
-			now.alias = strip_focus(alias ? alias : "");
-			now.alias_hash = hash_bytes(now.alias.data(), now.alias.size());
-			if (is_new) {
-				ObjChange c;
-				c.handle = h;
-				c.added = true;
-				c.after = now;
-				result.objects.push_back(c);
-			} else if (moved || it->second.alias_hash != now.alias_hash) {
-				ObjChange c;
-				c.handle = h;
-				c.moved = moved;
-				c.content = it->second.alias_hash != now.alias_hash;
-				c.before = it->second;
-				c.after = now;
-				result.objects.push_back(c);
-			}
-			state.objects[h] = now;
-		}
-		for (auto it = state.objects.begin(); it != state.objects.end();) {
-			if (!positions.count(it->first)) {
-				ObjChange c;
-				c.handle = it->first;
-				c.removed = true;
-				c.before = it->second;
-				result.objects.push_back(c);
-				it = state.objects.erase(it);
-			} else {
-				++it;
-			}
-		}
-
-		// レイヤー: 名前とロックは実体が無くても標準の値が返るので広く読み、
-		// 表示・非表示は実体の無いレイヤーで非表示と返るので、オブジェクトのある範囲と表示範囲だけ読む
-		int narrow_max = std::max(param->info.layer_max, param->info.display_layer_start + param->info.display_layer_num - 1);
-		int wide_max = narrow_max;
-		if (!state.layers.empty()) wide_max = std::max(wide_max, state.layers.rbegin()->first);
-		for (int layer = 0; layer <= wide_max; layer++) {
-			LayerState now;
-			LPCWSTR name = edit->get_layer_name(layer);
-			if (name) now.name = name;
-			now.lock = edit->get_layer_lock(layer);
-			auto it = state.layers.find(layer);
-			LayerState before = it != state.layers.end() ? it->second : LayerState();
-			now.enable = layer <= narrow_max ? edit->get_layer_enable(layer) : before.enable;
-			if (now != before) result.layers.push_back({ layer, before, now });
-			if (now.is_default()) state.layers.erase(layer);
-			else state.layers[layer] = now;
-		}
-	});
-	// プロジェクトファイルは保存して読むので重い。全体を読み直す時・レイヤーの状態が変わった時・オブジェクトが増えた時だけ読む
-	// (名前等が[layer.N]にも書かれる場合や、グループ化されたオブジェクトの貼り付け等で、写しが古いまま残らないようにする)
-	bool added = false;
-	for (auto& c : param.result.objects) if (c.added) added = true;
-	if (param.result.ok && (full || added || !param.result.layers.empty())) refresh_project_file(sh, param.result);
-	return param.result;
-}
-
-
-// 1つのオブジェクトの1つの数値の設定項目だけが変わったか (数値欄へのキーボード入力の途中の通知を見分けるため)
-bool single_numeric_change(const Refresh& r, OBJECT_HANDLE& handle, std::string& effect, std::string& key,
-	std::string& before, std::string& after) {
-	if (r.objects.size() != 1 || !r.layers.empty()) return false;
-	const ObjChange& c = r.objects[0];
-	if (c.added || c.removed || c.moved || !c.content) return false;
-	auto a = parse_alias(c.before.alias);
-	auto b = parse_alias(c.after.alias);
-	if (a.size() != b.size()) return false;
-	int count = 0;
-	std::string section;
-	for (size_t i = 0; i < b.size(); i++) {
-		if (a[i].name != b[i].name || a[i].items.size() != b[i].items.size()) return false;
-		for (size_t j = 0; j < b[i].items.size(); j++) {
-			if (a[i].items[j].first != b[i].items[j].first) return false;
-			if (a[i].items[j].second == b[i].items[j].second) continue;
-			if (b[i].name == "Object") return false;
-			count++;
-			section = b[i].name;
-			effect = section_value(b[i], "effect.name");
-			key = b[i].items[j].first;
-			before = a[i].items[j].second;
-			after = b[i].items[j].second;
-		}
-	}
-	if (count != 1 || is_text_item(effect, key)) return false;	// 文字列の項目は本体が1文字ずつUndoを積むので対象外
-	// 表示用の名前にする (同じエフェクトが複数ある時は「ぼかし[2]」になり、入力の続きかの判定でも区別される)
-	effect = effect_display_names(b)[section];
-	TrackValue tb = parse_track(before), ta = parse_track(after);
-	if (tb.track || ta.track) {
-		if (!tb.track || !ta.track || tb.move != ta.move || tb.param != ta.param || tb.extra != ta.extra || tb.expression != ta.expression ||
-			tb.values.size() != ta.values.size()) return false;
-		int diff = 0;
-		for (size_t j = 0; j < ta.values.size(); j++) if (tb.values[j] != ta.values[j]) diff++;
-		if (diff != 1) return false;
-	} else if (!is_numeric_value(before) || !is_numeric_value(after)) {
-		return false;
-	}
-	handle = c.handle;
-	return true;
-}
-
-// 変わったものから、ラベル・対象オブジェクト・テキスト入力かどうかを作る
-// フレーム番号を時刻の文字列にする (60秒未満は「1.23秒」、以上は「1:05.20」)
-int g_rate = 60, g_scale = 1;	// ラベルを作る時点のシーンのフレームレート
-
-std::wstring time_text(int frame) {
-	double sec = g_rate > 0 ? (double)frame * g_scale / g_rate : 0;
-	wchar_t buf[32];
-	if (sec < 60) swprintf_s(buf, L"%.2f秒", sec);
-	else swprintf_s(buf, L"%d:%05.2f", (int)(sec / 60), sec - (int)(sec / 60) * 60);
-	return buf;
-}
-
-// エイリアスの[Object]セクションのframe (開始,中間点…,終了) を、オブジェクトの開始フレーム基準の絶対フレームにして返す
-std::vector<int> section_frames(const ObjState& o) {
-	std::vector<int> frames;
-	for (auto& s : parse_alias(o.alias)) {
-		if (s.name != "Object") continue;
-		std::string v = section_value(s, "frame");
-		size_t pos = 0;
-		while (pos < v.size()) {
-			size_t comma = v.find(',', pos);
-			if (comma == std::string::npos) comma = v.size();
-			frames.push_back(atoi(v.substr(pos, comma - pos).c_str()));
-			pos = comma + 1;
-		}
-	}
-	if (!frames.empty()) {
-		int base = frames[0];
-		for (auto& f : frames) f = f - base + o.lf.start;
-	}
-	return frames;
-}
-
-// 中間点の変化を説明する (変化が無ければ空)
-std::wstring describe_section_change(const ObjState& before, const ObjState& after) {
-	auto a = section_frames(before);
-	auto b = section_frames(after);
-	if (a.size() < 2 || b.size() < 2) return L"";
-	std::vector<int> ma(a.begin() + 1, a.end() - 1), mb(b.begin() + 1, b.end() - 1);
-	if (mb.size() > ma.size()) {
-		for (int f : mb) if (std::find(ma.begin(), ma.end(), f) == ma.end()) return L"中間点を追加 (" + time_text(f) + L")";
-		return L"中間点を追加";
-	}
-	if (mb.size() < ma.size()) {
-		for (int f : ma) if (std::find(mb.begin(), mb.end(), f) == mb.end()) return L"中間点を削除 (" + time_text(f) + L")";
-		return L"中間点を削除";
-	}
-	// 位置の変化(移動・長さの変更)で全体がずれた場合は中間点の移動とはみなさない
-	int shift = after.lf.start - before.lf.start;
-	for (size_t i = 0; i < ma.size(); i++) {
-		if (mb[i] != ma[i] && mb[i] != ma[i] + shift) {
-			return L"中間点を移動 (" + time_text(ma[i]) + L"→" + time_text(mb[i]) + L")";
-		}
-	}
-	return L"";
-}
 
 // 位置の変化(移動・レイヤー移動・長さの変更)を説明する (変化が無ければ空)
-std::wstring describe_position_change(const ObjState& before, const ObjState& after) {
-	const OBJECT_LAYER_FRAME& a = before.lf;
-	const OBJECT_LAYER_FRAME& b = after.lf;
+std::wstring describe_position_change(const ObjPos& a, const ObjPos& b) {
 	bool layer = a.layer != b.layer;
 	bool start = a.start != b.start;
 	bool end = a.end != b.end;
@@ -1056,301 +352,36 @@ std::wstring describe_position_change(const ObjState& before, const ObjState& af
 		time_text(b.start) + L"〜" + time_text(b.end + 1) + L")";
 }
 
-// 1つのオブジェクトの変化を説明する。text_item: 変わったのが1つの文字列の項目だけなら「エフェクト名\x1f項目名」
-std::wstring describe_object_change(const ObjChange& c, std::string& text_item) {
-	text_item.clear();
-	if (c.added) return object_title(c.after) + L" を追加 (" + time_text(c.after.lf.start) + L")";
-	if (c.removed) return object_title(c.before) + L" を削除";
-	std::wstring title = object_title(c.before);
-	std::wstring position = describe_position_change(c.before, c.after);
-	std::wstring section = describe_section_change(c.before, c.after);
-	if (!section.empty()) {
-		// 中間点の追加・削除では各設定項目の値の並びも変わるので、設定の変更としては出さない
-		return title + L" " + section + (position.empty() ? L"" : L" / " + position);
+// 中間点(オブジェクトの開始からの相対フレーム)の変化を説明する (変化が無ければ空)
+std::wstring describe_section_change(const std::vector<int>& a, int start_a, const std::vector<int>& b, int start_b) {
+	if (a.size() < b.size()) {
+		for (int f : b) if (std::find(a.begin(), a.end(), f) == a.end()) return L"中間点を追加 (" + time_text(start_b + f) + L")";
+		return L"中間点を追加";
 	}
-	std::wstring content;
-	if (c.content) {
-		std::string item;
-		content = describe_content_change(c.before, c.after, item);
-		if (content == L"を変更") content.clear();	// [Object]セクション(位置)だけの変化
-		if (position.empty()) text_item = item;
+	if (a.size() > b.size()) {
+		for (int f : a) if (std::find(b.begin(), b.end(), f) == b.end()) return L"中間点を削除 (" + time_text(start_a + f) + L")";
+		return L"中間点を削除";
 	}
-	if (!position.empty() && !content.empty()) return title + L" " + position + L" / " + content;
-	if (!position.empty()) return title + L" " + position;
-	if (!content.empty()) return title + L" " + content;
-	return title + L" を変更";
+	for (size_t i = 0; i < a.size(); i++) {
+		if (a[i] != b[i]) return L"中間点を移動 (" + time_text(start_a + a[i]) + L"→" + time_text(start_b + b[i]) + L")";
+	}
+	return L"";
 }
 
 // 設定項目がグループ(X,Y,Z等)に属していれば、グループの最初の項目名を返す (属していなければ項目名)。結果は覚えておく
-std::string item_group_head(const std::string& effect, const std::string& key) {
-	static std::map<std::pair<std::string, std::string>, std::string> cache;
-	auto cache_key = std::make_pair(effect, key);
-	auto it = cache.find(cache_key);
+std::wstring item_group_head(const std::wstring& effect, const std::wstring& item) {
+	static std::map<std::pair<std::wstring, std::wstring>, std::wstring> cache;
+	auto key = std::make_pair(effect, item);
+	auto it = cache.find(key);
 	if (it != cache.end()) return it->second;
-	std::string head = key;
+	std::wstring head = item;
 	if (edit_handle && !effect.empty()) {
 		LPCWSTR names[32] = {};
-		int n = edit_handle->get_effect_item_group_names(utf8_to_wide(effect).c_str(), utf8_to_wide(key).c_str(), names, 32, nullptr);
-		if (n > 0 && names[0]) {
-			int size = WideCharToMultiByte(CP_UTF8, 0, names[0], -1, nullptr, 0, nullptr, nullptr);
-			if (size > 1) {
-				std::string text(size - 1, '\0');
-				WideCharToMultiByte(CP_UTF8, 0, names[0], -1, text.data(), size, nullptr, nullptr);
-				head = text;
-			}
-		}
+		int n = edit_handle->get_effect_item_group_names(effect.c_str(), item.c_str(), names, 32, nullptr);
+		if (n > 0 && names[0]) head = names[0];
 	}
-	cache[cache_key] = head;
+	cache[key] = head;
 	return head;
-}
-
-// 同じパラメータの連続した変更を表示上まとめるための識別子 (まとめない変更なら空)
-//   位置だけの変更: 「\x1c移動」(長さが変わらない) /「\x1c長さ」
-//   数値項目の値だけの変更 (移動方法・参照式等は変わらない): 「\x1dセクション名\x1f項目名\x1e…」
-std::string value_group_key(const ObjChange& c) {
-	if (c.added || c.removed) return "";
-	if (c.moved) {
-		if (c.content) {
-			std::string item;
-			if (describe_content_change(c.before, c.after, item) != L"を変更") return "";	// 位置以外も変わった
-		}
-		bool same_length = (c.before.lf.end - c.before.lf.start) == (c.after.lf.end - c.after.lf.start);
-		return same_length ? "\x1c移動" : "\x1c長さ";
-	}
-	if (!c.content) return "";
-	auto a = parse_alias(c.before.alias);
-	auto b = parse_alias(c.after.alias);
-	if (a.size() != b.size()) return "";
-	std::string key;
-	std::set<std::string> groups;	// 変わった項目 (セクション名\x1fグループの最初の項目名)
-	for (size_t i = 0; i < b.size(); i++) {
-		if (a[i].name != b[i].name) return "";
-		std::string effect = section_value(b[i], "effect.name");
-		if (effect != section_value(a[i], "effect.name")) return "";
-		if (a[i].items.size() != b[i].items.size()) return "";
-		for (size_t j = 0; j < b[i].items.size(); j++) {
-			const auto& [k, v] = b[i].items[j];
-			if (a[i].items[j].first != k) return "";
-			const std::string& old_value = a[i].items[j].second;
-			if (old_value == v) continue;
-			if (b[i].name == "Object") return "";	// クリッピング・名前等
-			if (is_text_item(effect, k)) return "";
-			TrackValue ta = parse_track(old_value), tb = parse_track(v);
-			if (ta.track != tb.track) return "";
-			if (ta.track) {
-				if (ta.move != tb.move || ta.param != tb.param || ta.extra != tb.extra || ta.expression != tb.expression ||
-					ta.values.size() != tb.values.size()) return "";
-			} else if (!is_numeric_value(old_value) || !is_numeric_value(v)) {
-				return "";
-			}
-			// グループ(X,Y,Z等)の項目はグループで数える (「X,Yの変更」と「Xだけの変更」を同じパラメータとしてまとめる)
-			groups.insert(b[i].name + "\x1f" + item_group_head(effect, k));
-		}
-	}
-	for (auto& g : groups) key += g + "\x1e";
-	return key.empty() ? "" : "\x1d" + key;
-}
-
-// 変わったものから、ラベル・対象オブジェクト・テキスト入力かどうかを作る
-void make_entry_info(const Refresh& r, Entry& e) {
-	EDIT_INFO info = {};
-	edit_handle->get_edit_info(&info, sizeof(info));
-	if (info.rate > 0) { g_rate = info.rate; g_scale = info.scale; }
-
-	std::vector<std::wstring> texts;
-	for (auto& c : r.objects) e.objects.push_back(c.handle);
-
-	// 分割: 同じレイヤーで、変化の前の区間 [s, e] が、変化の後の区間 [s, m-1] [m, e] の2つに分かれた
-	// (本体が「元のオブジェクトを短くして後ろを追加する」形でも「削除して2つ作り直す」形でも見分けられるようにする)。
-	// 複数のオブジェクトを選択して一度に分割した場合は、変化の前の区間の全てがそれぞれ2つに分かれている
-	if (r.layers.empty()) {
-		std::vector<const ObjState*> before, after;
-		for (auto& c : r.objects) {
-			if (c.removed) before.push_back(&c.before);
-			else if (c.added) after.push_back(&c.after);
-			else if (c.moved) { before.push_back(&c.before); after.push_back(&c.after); }
-		}
-		if (!before.empty() && after.size() == before.size() * 2) {
-			std::vector<bool> used(after.size(), false);
-			std::vector<int> points;	// 分割した位置 (後ろの区間の開始)
-			for (const ObjState* b : before) {
-				int first = -1, second = -1;
-				for (size_t i = 0; i < after.size() && first < 0; i++) {
-					const OBJECT_LAYER_FRAME& a = after[i]->lf;
-					if (!used[i] && a.layer == b->lf.layer && a.start == b->lf.start && a.end < b->lf.end) first = (int)i;
-				}
-				if (first < 0) break;
-				for (size_t i = 0; i < after.size() && second < 0; i++) {
-					const OBJECT_LAYER_FRAME& a = after[i]->lf;
-					if (!used[i] && (int)i != first && a.layer == b->lf.layer && a.start == after[first]->lf.end + 1 &&
-						a.end == b->lf.end) second = (int)i;
-				}
-				if (second < 0) break;
-				used[first] = used[second] = true;
-				points.push_back(after[second]->lf.start);
-			}
-			if (points.size() == before.size()) {
-				bool same_point = std::all_of(points.begin(), points.end(), [&](int f) { return f == points[0]; });
-				std::wstring at = same_point ? L" (" + time_text(points[0]) + L")" : L"";
-				if (before.size() == 1) e.label = object_title(*before[0]) + L" を分割" + at;
-				else e.label = std::to_wstring(before.size()) + L"個のオブジェクトを分割" + at;
-				return;
-			}
-		}
-	}
-
-	// 複数のオブジェクトをまとめて移動・長さ変更: 全オブジェクトの変化が位置だけで、全て移動か全て長さの変更なら1件にする
-	if (r.layers.empty() && r.objects.size() >= 2) {
-		std::vector<const ObjChange*> list;
-		bool ok = true;
-		for (auto& c : r.objects) {
-			if (c.added || c.removed || !c.moved) { ok = false; break; }
-			if (c.content) {
-				std::string item;
-				if (describe_content_change(c.before, c.after, item) != L"を変更") { ok = false; break; }	// 位置以外も変わった
-			}
-			list.push_back(&c);
-		}
-		if (ok) {
-			std::sort(list.begin(), list.end(), [](const ObjChange* x, const ObjChange* y) {
-				return x->before.lf.layer != y->before.lf.layer ? x->before.lf.layer < y->before.lf.layer : x->before.lf.start < y->before.lf.start;
-			});
-			bool any_layer = false, any_start = false, any_end = false, all_same_length = true;
-			std::vector<int> layer_a, layer_b, start_a, start_b, end_a, end_b;
-			for (auto* c : list) {
-				const OBJECT_LAYER_FRAME& a = c->before.lf;
-				const OBJECT_LAYER_FRAME& b = c->after.lf;
-				any_layer |= a.layer != b.layer;
-				any_start |= a.start != b.start;
-				any_end |= a.end != b.end;
-				all_same_length &= (a.end - a.start) == (b.end - b.start);
-				layer_a.push_back(a.layer); layer_b.push_back(b.layer);
-				start_a.push_back(a.start); start_b.push_back(b.start);
-				end_a.push_back(a.end + 1); end_b.push_back(b.end + 1);
-			}
-			// 変更前→変更後の一覧。4個以上は長くなるので、ずれ幅が揃っていれば「+0.50秒」の形にする
-			auto frames_text = [&](const std::vector<int>& fa, const std::vector<int>& fb) -> std::wstring {
-				if (fa.size() <= 3) {
-					std::wstring ta, tb;
-					for (size_t i = 0; i < fa.size(); i++) { ta += (i ? L"," : L"") + time_text(fa[i]); tb += (i ? L"," : L"") + time_text(fb[i]); }
-					return ta + L"→" + tb;
-				}
-				int delta = fb[0] - fa[0];
-				for (size_t i = 0; i < fa.size(); i++) if (fb[i] - fa[i] != delta) return L"";
-				return (delta >= 0 ? L"+" : L"-") + time_text(delta >= 0 ? delta : -delta);
-			};
-			auto layers_text = [&]() -> std::wstring {
-				if (layer_a.size() > 3) {
-					int delta = layer_b[0] - layer_a[0];
-					for (size_t i = 0; i < layer_a.size(); i++) if (layer_b[i] - layer_a[i] != delta) return L"";
-					return L"レイヤー " + std::wstring(delta >= 0 ? L"+" : L"") + std::to_wstring(delta);
-				}
-				std::wstring ta, tb;
-				for (size_t i = 0; i < layer_a.size(); i++) {
-					ta += (i ? L"," : L"") + (L"L" + std::to_wstring(layer_a[i] + 1));
-					tb += (i ? L"," : L"") + (L"L" + std::to_wstring(layer_b[i] + 1));
-				}
-				return ta + L"→" + tb;
-			};
-			std::wstring count = std::to_wstring(list.size()) + L"個のオブジェクト";
-			std::vector<std::wstring> details;
-			std::wstring what;
-			if (all_same_length) {
-				what = L"を移動";
-				if (any_layer) details.push_back(layers_text());
-				if (any_start) { std::wstring t = frames_text(start_a, start_b); if (!t.empty()) details.push_back(L"開始 " + t); }
-			} else if (!any_layer) {
-				what = L"の長さを変更";
-				if (any_start && !any_end) { std::wstring t = frames_text(start_a, start_b); if (!t.empty()) details.push_back(L"開始 " + t); }
-				if (any_end && !any_start) { std::wstring t = frames_text(end_a, end_b); if (!t.empty()) details.push_back(L"終了 " + t); }
-			}
-			if (!what.empty()) {
-				std::wstring detail;
-				for (auto& d : details) if (!d.empty()) detail += (detail.empty() ? L"" : L" / ") + d;
-				e.label = count + what + (detail.empty() ? L"" : L" (" + detail + L")");
-				return;
-			}
-		}
-	}
-
-	for (auto& c : r.objects) {
-		std::string text_item;
-		texts.push_back(describe_object_change(c, text_item));
-		if (!text_item.empty() && r.objects.size() == 1 && r.layers.empty()) {
-			e.text_object = c.handle;
-			e.text_item = text_item;
-		}
-		if (r.objects.size() == 1 && r.layers.empty() && !c.added && !c.removed) {
-			e.has_change = true;
-			e.change_before = c.before;
-			e.change_after = c.after;
-			if (e.text_item.empty()) {
-				std::string key = value_group_key(c);
-				if (!key.empty()) {
-					e.text_object = c.handle;
-					e.text_item = key;
-				}
-			}
-		}
-	}
-	for (auto& c : r.layers) {
-		std::wstring what;
-		if (c.before.name != c.after.name) what = L"名前「" + c.after.name + L"」";
-		else if (c.before.enable != c.after.enable) what = c.after.enable ? L"表示" : L"非表示";
-		else what = c.after.lock ? L"ロック" : L"ロック解除";
-		texts.push_back(L"レイヤー" + std::to_wstring(c.layer + 1) + L" " + what);
-	}
-	if (!r.groups.empty()) {
-		// 新しく現れたオブジェクトのグループは、オブジェクトの追加として説明しているので数えない
-		int grouped = 0, ungrouped = 0;
-		for (auto& g : r.groups) {
-			bool added = false;
-			for (auto& c : r.objects) if (c.handle == g.handle && c.added) added = true;
-			if (added) continue;
-			(g.after ? grouped : ungrouped)++;
-		}
-		if (grouped) texts.push_back(std::to_wstring(grouped) + L"個のオブジェクトをグループ化");
-		else if (ungrouped) texts.push_back(std::to_wstring(ungrouped) + L"個のオブジェクトのグループを解除");
-	}
-	for (auto& c : r.settings) {
-		// 名前・表示・ロックの変更と同じレイヤーなら、そちらで説明しているので出さない
-		bool described = false;
-		for (auto& l : r.layers) if (l.layer == c.layer) described = true;
-		if (described) continue;
-		std::set<std::string> keys;
-		for (auto& [key, value] : c.before) keys.insert(key);
-		for (auto& [key, value] : c.after) keys.insert(key);
-		std::wstring items;
-		std::string changed_key;
-		int count = 0;
-		for (auto& key : keys) {
-			auto a = c.before.find(key);
-			auto b = c.after.find(key);
-			bool has_a = a != c.before.end(), has_b = b != c.after.end();
-			if (has_a == has_b && (!has_a || a->second == b->second)) continue;
-			items += (items.empty() ? L"" : L", ") + layer_setting_name(key) + L" " +
-				layer_setting_value(c.before, key) + L"→" + layer_setting_value(c.after, key);
-			changed_key = key;
-			count++;
-		}
-		if (items.empty()) continue;
-		std::wstring prefix = L"レイヤー" + std::to_wstring(c.layer + 1) + L" ";
-		texts.push_back(prefix + items);
-		// 同じレイヤーの同じ項目の変更が続く時は表示上まとめる (レイヤー番号をハンドルの代わりにする。項目の頭の\x1bで区別する)
-		if (count == 1 && r.objects.empty() && r.layers.empty() && r.settings.size() == 1) {
-			e.text_object = (OBJECT_HANDLE)(intptr_t)(c.layer + 1);
-			e.text_item = "\x1b" + changed_key;
-			e.setting_prefix = prefix + layer_setting_name(changed_key) + L" ";
-			e.setting_before = layer_setting_value(c.before, changed_key);
-			e.setting_after = layer_setting_value(c.after, changed_key);
-		}
-	}
-	if (texts.empty()) {
-		e.label = L"(内容を特定できない編集)";
-		return;
-	}
-	e.label = texts[0];
-	if (texts.size() > 1) e.label += L" 他" + std::to_wstring(texts.size() - 1) + L"件";
 }
 
 //=======================================================================
@@ -1367,13 +398,9 @@ std::wstring get_menu_text(HMENU menu, int pos) {
 	return buf;
 }
 
-// メニューの項目名 (表示言語ごと。日本語・英語・韓国語・中国語)。先に並べた名前を優先して探す。
-// グループ化・グループ解除は、タイムラインの右クリックのメニューの名前も含む (日本語・韓国語はメインメニューと名前が違うので、
-// メインメニューの名前を先に並べる。メインメニューで見つからないとショートカットキーの割り当てを読めない)
+// メニューの項目名 (表示言語ごと。日本語・英語・韓国語・中国語)。先に並べた名前を優先して探す
 const wchar_t* const UNDO_NAMES[] = { L"元に戻す", L"Undo", L"되돌리다", L"撤销", nullptr };
 const wchar_t* const REDO_NAMES[] = { L"やり直し", L"やり直す", L"Redo", L"다시 하다", L"重做", nullptr };
-const wchar_t* const GROUP_NAMES[] = { L"オブジェクトのグループ化", L"객체를 그룹화", L"グループ化", L"Group Object", L"그룹화", L"组合对象", nullptr };
-const wchar_t* const UNGROUP_NAMES[] = { L"オブジェクトのグループ解除", L"객체의 그룹 해제", L"グループ解除", L"Ungroup Object", L"그룹 해제", L"取消组合对象", nullptr };
 
 // アクセスキーの印(&)を除く
 std::wstring strip_access_key(std::wstring text) {
@@ -1388,367 +415,1218 @@ bool is_menu_name(const std::wstring& text, const wchar_t* name) {
 	return strip_access_key(text).compare(0, wcslen(name), name) == 0;
 }
 
-// 表示名がnamesのどれかで始まるか
-bool is_menu_name_any(const std::wstring& text, const wchar_t* const* names) {
-	for (; *names; names++) if (is_menu_name(text, *names)) return true;
-	return false;
-}
-
 // メニューを再帰的に探し、表示名がnameの項目のIDを返す (見つからなければ0)
 // IDはプラグインのメニュー登録数によってずれるため、固定値ではなく名前で探す
-// parent: 見つかった項目を含むポップアップメニュー / parent_pos: そのポップアップの親メニュー内での位置
-UINT find_menu_item(HMENU menu, const wchar_t* name, HMENU* parent, int* parent_pos, int menu_pos = -1) {
+UINT find_menu_item(HMENU menu, const wchar_t* name) {
 	int count = GetMenuItemCount(menu);
 	for (int i = 0; i < count; i++) {
 		MENUITEMINFOW mii = { sizeof(mii) };
 		mii.fMask = MIIM_ID | MIIM_SUBMENU;
 		if (!GetMenuItemInfoW(menu, i, TRUE, &mii)) continue;
 		if (mii.hSubMenu) {
-			if (UINT id = find_menu_item(mii.hSubMenu, name, parent, parent_pos, i)) return id;
+			if (UINT id = find_menu_item(mii.hSubMenu, name)) return id;
 		} else if (is_menu_name(get_menu_text(menu, i), name)) {
-			if (parent) *parent = menu_pos >= 0 ? menu : nullptr;
-			if (parent_pos) *parent_pos = menu_pos;
 			return mii.wID;
 		}
 	}
 	return 0;
 }
 
-// namesのどれかの項目を探す (先に並べた名前を優先する)。matched: 一致した名前
-UINT find_menu_item_any(HMENU menu, const wchar_t* const* names, HMENU* parent, int* parent_pos, const wchar_t** matched = nullptr) {
-	for (; *names; names++) {
-		if (UINT id = find_menu_item(menu, *names, parent, parent_pos)) {
-			if (matched) *matched = *names;
-			return id;
-		}
-	}
-	return 0;
-}
-
+// namesのどれかの項目のIDを探す (先に並べた名前を優先する)
 UINT find_menu_id(const wchar_t* const* names) {
 	HMENU menu = GetMenu(edit_handle->get_host_app_window());
-	return menu ? find_menu_item_any(menu, names, nullptr, nullptr) : 0;
-}
-
-bool g_sending_initmenu = false;	// 自分が送ったWM_INITMENUPOPUPをサブクラスで区別するため
-
-// メインメニューの項目の有効状態 (1:有効 / 0:無効 / -1:見つからない)
-// 本体はメニューを開いた時にしか有効・無効を更新しないため、WM_INITMENUPOPUPを送って更新させてから読む
-int get_menu_enabled(const wchar_t* const* names) {
-	HWND main = edit_handle->get_host_app_window();
-	HMENU menu = GetMenu(main);
-	HMENU parent = nullptr;
-	int parent_pos = 0;
-	UINT id = menu ? find_menu_item_any(menu, names, &parent, &parent_pos) : 0;
-	if (!id) return -1;
-	if (parent) {
-		g_sending_initmenu = true;
-		SendMessageW(main, WM_INITMENUPOPUP, (WPARAM)parent, MAKELPARAM(parent_pos, FALSE));
-		g_sending_initmenu = false;
+	if (!menu) return 0;
+	for (; *names; names++) {
+		if (UINT id = find_menu_item(menu, *names)) return id;
 	}
-	return (GetMenuState(menu, id, MF_BYCOMMAND) & (MF_GRAYED | MF_DISABLED)) ? 0 : 1;
-}
-
-//=======================================================================
-//	Undo/Redoコマンドの観測
-//	ショートカットキー: メインスレッドのキーボードフック(割り当てはメニューの項目名から読み取る)
-//	メニューからの実行: メインウィンドウのサブクラス化でWM_COMMANDを見る
-//=======================================================================
-
-enum Command { CMD_NONE, CMD_UNDO, CMD_REDO };
-
-struct Shortcut {
-	bool valid = false, ctrl = false, shift = false, alt = false;
-	UINT vk = 0;
-};
-Shortcut g_undo_key, g_redo_key;
-UINT g_undo_id = 0, g_redo_id = 0;
-// オブジェクトのグループ化・グループ解除 (本体のUndoは積まれるが通知が来ないので、コマンドを観測してプロジェクトファイルを読む)
-Shortcut g_group_key, g_ungroup_key;
-UINT g_group_id = 0, g_ungroup_id = 0;
-HHOOK g_keyboard_hook = nullptr;
-HHOOK g_mouse_hook = nullptr;
-HHOOK g_callwnd_hook = nullptr;
-bool g_subclassed = false;
-std::deque<std::pair<Command, ULONGLONG>> g_observed;	// 観測したコマンドと時刻
-
-// ショートカットキー表記のキー名を仮想キーコードにする (対応していない名前は0)
-UINT key_name_to_vk(const std::wstring& name) {
-	if (name.empty()) return 0;
-	if (name.size() == 1) {
-		wchar_t c = (wchar_t)towupper(name[0]);
-		if ((c >= L'A' && c <= L'Z') || (c >= L'0' && c <= L'9')) return c;
-		return 0;
-	}
-	if ((name[0] == L'F' || name[0] == L'f') && name.size() <= 3) {
-		int n = _wtoi(name.c_str() + 1);
-		if (n >= 1 && n <= 24) return VK_F1 + n - 1;
-	}
-	struct { const wchar_t* name; UINT vk; } table[] = {
-		{ L"Delete", VK_DELETE }, { L"Insert", VK_INSERT }, { L"Space", VK_SPACE }, { L"Enter", VK_RETURN },
-		{ L"Tab", VK_TAB }, { L"Backspace", VK_BACK }, { L"Home", VK_HOME }, { L"End", VK_END },
-		{ L"PageUp", VK_PRIOR }, { L"PageDown", VK_NEXT }, { L"Esc", VK_ESCAPE },
-	};
-	for (auto& t : table) if (name == t.name) return t.vk;
 	return 0;
 }
 
-// メニューの項目名(「元に戻す\tCtrl+Z」)の後ろにあるショートカットキー表記を読み取る
-Shortcut read_shortcut(const wchar_t* const* names) {
-	Shortcut sc;
-	HMENU menu = GetMenu(edit_handle->get_host_app_window());
-	const wchar_t* name = nullptr;
-	UINT id = menu ? find_menu_item_any(menu, names, nullptr, nullptr, &name) : 0;
-	if (!id) return sc;
-	wchar_t buf[256] = {};
-	GetMenuStringW(menu, id, buf, _countof(buf), MF_BYCOMMAND);
-	std::wstring text = strip_access_key(buf);
-	// ショートカットキー表記はタブの後ろ。タブが無ければ名前とアクセスキー(「(U)」等)の後ろ
-	size_t pos = text.find(L'\t');
-	if (pos == std::wstring::npos) {
-		pos = std::min(wcslen(name), text.size());
-		if (pos < text.size() && text[pos] == L'(') {
-			size_t close = text.find(L')', pos);
-			if (close != std::wstring::npos) pos = close + 1;
+//=======================================================================
+//	本体のメモリの読み取り
+//	SDKにUndo履歴を読むAPIは無いので、本体のメモリ上の構造を直接読む (読むだけで、書き込みはしない)。
+//	構造は aviutl2.exe ver 2.1.19 を解析して確かめたもの:
+//	  UndoService (グローバル変数が指す)
+//	    +hist_off : 今のシーンの履歴(History*)。履歴はシーンごとにあり、シーンを切り替えると差し替わる
+//	  History
+//	    +pos_off-0x20 : 段の並び(std::deque<std::vector<UndoItem*>>)のmap / -0x18 mapの大きさ / -0x10 先頭の位置 / -0x08 段の数
+//	    +pos_off      : Undoした回数 (0なら最新の状態。段[0]が一番新しい)
+//	  UndoItem : +0 仮想関数表(種類はRTTIのクラス名で見分ける) / +8 対象(Object* / EffectBase* / Layer*等)のshared_ptr /
+//	             +0x18〜 変更前・変更後の状態 (種類ごとの形式は下の定数)
+//	段はコミットした後は変わらない。新しい編集は「やり直せる段を捨てて先頭に積み、上限を超えた古い段を捨てる」。
+//	場所は版ごとに変わるので、起動時に次の方法で割り出す:
+//	  ・「元に戻す」の処理(ログの文字列「Undo::UndoService::undo」を参照する関数)の中の
+//	    mov r1,[rip+UndoService*] / mov r2,[r1+hist_off] / mov r3,[r2+pos_off] の並びと、
+//	    今のシーンを取る mov r,[rip+編集の管理*] / … [r+scene_off] / [r+scene_off+8] (shared_ptr<Scene>) から読む
+//	  ・仮想関数表は、クラス名の型情報 → Complete Object Locator → 仮想関数表の順に探す
+//	オブジェクト・エフェクト・設定項目の中の位置は固定の値で、読んだ値が想定の範囲かを確かめながら使う
+//=======================================================================
+
+enum UndoKind {
+	UK_UNKNOWN, UK_OBJECT_UPDATE, UK_OBJECT_CREATE_DELETE, UK_OBJECT_FLAG, UK_OBJECT_EFFECT, UK_OBJECT_GROUP,
+	UK_OBJECT_SECTION, UK_OBJECT_LAYER_RANGE, UK_EFFECT_UPDATE, UK_LAYER_UPDATE, UK_LAYER_MOVE, UK_LAYER_CREATE_DELETE,
+	UK_COLOR_SETTING,
+	// 設定項目(EffectItem)の種類
+	UK_ITEM_NUMBER, UK_ITEM_TEXT, UK_ITEM_STRING, UK_ITEM_CHECK, UK_ITEM_COLOR, UK_ITEM_COLOR_LIST, UK_ITEM_SELECT, UK_NO_MOVE,
+	UK_COUNT
+};
+const char* const KIND_RTTI[UK_COUNT] = {
+	nullptr,
+	".?AV?$UndoItemTemplate@VObject@Edit@@VObjectUndoUpdate@2@@Undo@@",			// レイヤー・開始・終了・名前・中間点
+	".?AV?$UndoItemTemplate@VObject@Edit@@VObjectUndoCreateDelete@2@@Undo@@",	// オブジェクトの追加・削除
+	".?AV?$UndoItemTemplate@VObject@Edit@@VObjectUndoFlag@2@@Undo@@",			// クリッピング・カメラ制御等のフラグ
+	".?AV?$UndoItemTemplate@VObject@Edit@@VObjectUndoEffect@2@@Undo@@",			// エフェクトの並び(追加・削除・順番)
+	".?AV?$UndoItemTemplate@VObject@Edit@@VObjectUndoGroup@2@@Undo@@",			// オブジェクトのグループ化
+	".?AV?$UndoItemTemplate@VObject@Edit@@VObjectUndoSection@2@@Undo@@",			// 中間点
+	".?AV?$UndoItemTemplate@VObject@Edit@@VObjectUndoLayerRange@2@@Undo@@",
+	".?AV?$UndoItemTemplate@VEffectBase@Effect@@VEffectUndoUpdate@2@@Undo@@",	// エフェクトの設定項目・表示・ロック (対象はEffectBase)
+	".?AV?$UndoItemTemplate@VLayer@Edit@@VLayerUndoUpdate@2@@Undo@@",			// レイヤーの名前・表示・ロック・レイヤー設定
+	".?AV?$UndoItemTemplate@VLayer@Edit@@VLayerUndoMove@2@@Undo@@",
+	".?AV?$UndoItemTemplate@VLayer@Edit@@VLayerUndoCreateDelete@2@@Undo@@",
+	".?AV?$UndoItemTemplate@VColorSetting@Component@@VColorSettingUndoUpdate@2@@Undo@@",
+	".?AVEffectItemNumber@Effect@@",
+	".?AVEffectItemText@Effect@@",
+	".?AVEffectItemString@Effect@@",
+	".?AVEffectItemCheck@Effect@@",
+	".?AVEffectItemColor@Effect@@",
+	".?AVEffectItemColorList@Effect@@",
+	".?AVEffectItemSelect@Effect@@",
+	".?AVNoMove@Effect@@",
+};
+
+
+// Object
+#define OBJ_EFFECTS			0x18	// std::vector<std::shared_ptr<EffectBase>> (16バイトずつ)
+#define OBJ_GROUP			0x30	// 所属するグループ (std::shared_ptr。0ならグループ無し)
+#define OBJ_START			0x50	// int 開始フレーム
+#define OBJ_END				0x54	// int 終了フレーム
+#define OBJ_SECTIONS		0x58	// std::vector<int> 中間点 (開始からの相対フレーム)
+#define OBJ_LAYER			0x70	// int レイヤー (SDKと同じ0始まり)
+#define OBJ_FLAGS			0x74	// 1バイトずつ: クリッピング / カメラ制御の対象 / グループ制御の対象 / 上のオブジェクトでクリッピング
+#define OBJ_NAME			0x78	// std::wstring オブジェクト名
+// EffectBase
+#define EFFECT_OWNER		0x28	// Object*
+#define EFFECT_NAME			0x40	// const wchar_t* エフェクト名
+#define EFFECT_LOCK			0x59
+#define EFFECT_DISABLE		0x5A
+// EffectItem (EffectUndoUpdateの中の複製)
+#define ITEM_NAME			0x10	// std::wstring 項目名
+#define ITEM_VALUE			0x38	// チェック: bool / 色: int (0xBBGGRR) / テキスト・文字列: 削除・挿入した文字列 (std::wstring)
+#define TEXT_POSITION		0x58	// テキスト・文字列: 削除・挿入した位置 (変更前の複製が削除した文字列、変更後の複製が挿入した文字列を持つ)
+#define NUMBER_VALUES		0x40	// std::vector<int> 値の並び (始点,中間点…,終点)
+#define NUMBER_DENOMINATOR	0x64	// int 値の分母 (小数2桁なら100)
+#define NUMBER_MOVE			0x68	// 移動方法のオブジェクト (+8が名前のconst wchar_t*)
+#define NUMBER_EXPRESSION	0xA0	// std::wstring 参照式
+#define NUMBER_PARAM		0xC0	// int 設定 (ビットの組)
+#define SELECT_OPTIONS		0x38	// 選択: 選択肢の表 (std::map<int, const wchar_t*>*。番号→名前。本体のエフェクトもスクリプトの--selectも同じ)
+#define SELECT_INDEX		0x40	// 選択: int 選んだ番号
+#define COLORLIST_COLORS	0x38	// 色リスト: std::vector<{uint32 色(0xAABBGGRR), float 位置, uint32}>
+#define COLORLIST_NAMES		0x58	// 色リスト: std::vector<std::wstring> 色の名前 (開始色・中間色1…)
+// Undoの項目の変更前・変更後の状態
+#define UPDATE_BEFORE		0x18	// ObjectUndoUpdate: {int レイヤー, int 開始, int 終了, int, std::wstring 名前, std::vector<int>* 中間点}
+#define UPDATE_AFTER		0x50
+#define UPDATE_NAME			0x10
+#define UPDATE_SECTIONS		0x30	// std::vector<int>* (中間点が無ければnull)
+#define CREATE_DELETE_STATE	0x18	// ObjectUndoCreateDelete: int 変更前・変更後のレイヤー (-1はオブジェクトが無い)
+#define FLAG_STATE			0x18	// ObjectUndoFlag: int 変更前・変更後
+#define EFFECTS_BEFORE		0x18	// ObjectUndoEffect: エフェクトの並び
+#define EFFECTS_AFTER		0x30
+#define GROUP_BEFORE		0x18	// ObjectUndoGroup: グループ
+#define GROUP_AFTER			0x28
+#define SECTIONS_BEFORE		0x18	// ObjectUndoSection: 中間点
+#define SECTIONS_AFTER		0x30
+#define EFFECT_ITEMS_BEFORE	0x18	// EffectUndoUpdate: 項目ごとの複製(変わった項目だけ、他はnull)の並び、+0x18 非表示、+0x19 ロック
+#define EFFECT_ITEMS_AFTER	0x38
+#define LAYER_BEFORE		0x18	// LayerUndoUpdate: {int X, int Y, float 音量, float 左右, bool 非表示, bool ロック, std::wstring 名前}
+#define LAYER_AFTER			0x60
+// Scene
+#define SCENE_LAYERS		0x08	// std::vector<レイヤーの枠*>。枠の+0x20がLayer*
+#define LAYER_SLOT_LAYER	0x20
+
+struct UndoLayout {
+	bool ok = false;
+	uintptr_t service_slot = 0;		// UndoService*が入っているグローバル変数のアドレス
+	int hist_off = 0, pos_off = 0;
+	uintptr_t editor_slot = 0;		// 今のシーンを持つ管理オブジェクト*が入っているグローバル変数のアドレス (見つからなければ0)
+	int scene_off = 0;
+	std::map<uintptr_t, UndoKind> vtables;
+	std::wstring error;
+} g_undo;
+
+// 例外を捕まえてメモリを読む (__tryはC++のオブジェクトを持たない関数の中でしか使えないので分ける)
+static bool safe_copy(void* dst, uintptr_t src, size_t size) {
+	if (src < 0x10000) return false;
+	__try {
+		memcpy(dst, (const void*)src, size);
+		return true;
+	} __except (EXCEPTION_EXECUTE_HANDLER) {
+		return false;
+	}
+}
+
+template<class T> bool read_mem(uintptr_t addr, T& out) { return safe_copy(&out, addr, sizeof(T)); }
+template<class T> T read_or(uintptr_t addr, T fallback) { T v; return read_mem(addr, v) ? v : fallback; }
+
+// std::wstring (MSVC: 16バイトの領域か先頭のポインタ / +0x10 長さ / +0x18 容量)
+std::wstring read_wstring(uintptr_t addr) {
+	uint64_t size = 0, cap = 0;
+	if (!read_mem(addr + 0x10, size) || !read_mem(addr + 0x18, cap) || size > 100000 || cap < size) return L"";
+	uintptr_t p = cap >= 8 ? read_or<uintptr_t>(addr, 0) : addr;
+	std::wstring s((size_t)size, L'\0');
+	if (size && !safe_copy(s.data(), p, (size_t)size * 2)) return L"";
+	return s;
+}
+
+// const wchar_t* の文字列
+std::wstring read_cstr(uintptr_t p) {
+	std::wstring s;
+	for (int i = 0; i < 256; i++) {
+		wchar_t c;
+		if (!read_mem(p + i * 2, c) || !c) break;
+		s += c;
+	}
+	return s;
+}
+
+// std::vector<T>
+template<class T> std::vector<T> read_vector(uintptr_t addr, size_t stride = sizeof(T)) {
+	uintptr_t vec[2] = {};
+	std::vector<T> out;
+	if (!safe_copy(vec, addr, sizeof(vec)) || vec[1] < vec[0] || (vec[1] - vec[0]) / stride > 100000) return out;
+	for (uintptr_t p = vec[0]; p + sizeof(T) <= vec[1]; p += stride) {
+		T v;
+		if (!read_mem(p, v)) break;
+		out.push_back(v);
+	}
+	return out;
+}
+
+struct ImageRange {
+	uintptr_t start = 0, end = 0;
+};
+
+// 本体(exe)の節を名前で探す
+ImageRange image_section(const char* name) {
+	uintptr_t base = (uintptr_t)GetModuleHandleW(nullptr);
+	auto* dos = (const IMAGE_DOS_HEADER*)base;
+	auto* nt = (const IMAGE_NT_HEADERS64*)(base + dos->e_lfanew);
+	const IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
+	for (int i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+		char sec_name[9] = {};
+		memcpy(sec_name, sec[i].Name, 8);
+		if (strcmp(sec_name, name) == 0) return { base + sec[i].VirtualAddress, base + sec[i].VirtualAddress + sec[i].Misc.VirtualSize };
+	}
+	return {};
+}
+
+uintptr_t find_bytes(const ImageRange& r, const void* data, size_t size) {
+	const char* begin = (const char*)r.start;
+	const char* end = (const char*)r.end;
+	const char* it = std::search(begin, end, (const char*)data, (const char*)data + size);
+	return it == end ? 0 : (uintptr_t)it;
+}
+
+bool locate_undo_fail(const std::wstring& reason) {
+	g_undo.ok = false;
+	g_undo.error = reason;
+	return false;
+}
+
+// 本体のUndo履歴・今のシーンの場所と、項目の種類(仮想関数表)を割り出す
+bool locate_undo() {
+	g_undo = UndoLayout();
+	uintptr_t base = (uintptr_t)GetModuleHandleW(nullptr);
+	ImageRange text = image_section(".text"), rdata = image_section(".rdata"), data = image_section(".data");
+	if (!text.start || !rdata.start || !data.start) return locate_undo_fail(L"本体の節が見つからない");
+
+	// 「元に戻す」の処理が出すログの関数名 (終端の\0まで含めて探し、「…::undoText」と区別する)
+	static const char UNDO_NAME[] = "Undo::UndoService::undo";
+	uintptr_t str = find_bytes(rdata, UNDO_NAME, sizeof(UNDO_NAME));
+	if (!str) return locate_undo_fail(L"「元に戻す」の処理の目印が見つからない");
+	// 文字列を参照する lea r64,[rip+disp32] を探す
+	uintptr_t lea = 0;
+	for (uintptr_t p = text.start + 3; p + 4 <= text.end; p++) {
+		int32_t disp;
+		memcpy(&disp, (const void*)p, 4);
+		if (p + 4 + (intptr_t)disp != str) continue;
+		const uint8_t* b = (const uint8_t*)p - 3;
+		if ((b[0] & 0xF8) == 0x48 && b[1] == 0x8D && (b[2] & 0xC7) == 0x05) {
+			lea = p - 3;
+			break;
 		}
 	}
-	while (pos < text.size() && (text[pos] == L' ' || text[pos] == L'\t')) pos++;
-	std::wstring rest = text.substr(pos);
-	while (!rest.empty() && rest.back() == L' ') rest.pop_back();
-	if (rest.empty()) return sc;
-	while (true) {
-		size_t plus = rest.find(L'+');
-		if (plus == std::wstring::npos || plus == rest.size() - 1) break;
-		std::wstring mod = rest.substr(0, plus);
-		if (mod == L"Ctrl") sc.ctrl = true;
-		else if (mod == L"Shift") sc.shift = true;
-		else if (mod == L"Alt") sc.alt = true;
-		else return sc;
-		rest = rest.substr(plus + 1);
+	if (!lea) return locate_undo_fail(L"「元に戻す」の処理が見つからない");
+	DWORD64 image_base = 0;
+	PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(lea, &image_base, nullptr);
+	if (!rf) return locate_undo_fail(L"「元に戻す」の処理の先頭が見つからない");
+	uintptr_t func = (uintptr_t)image_base + rf->BeginAddress;
+	uintptr_t func_end = (uintptr_t)image_base + rf->EndAddress;
+
+	auto is_mov = [](const uint8_t* b) { return (b[0] & 0xF8) == 0x48 && b[1] == 0x8B; };
+	auto is_rip = [](const uint8_t* b) { return (b[2] & 0xC7) == 0x05; };
+	auto reg_of = [](const uint8_t* b) { return ((b[0] & 4) ? 8 : 0) | ((b[2] >> 3) & 7); };
+	auto base_of = [](const uint8_t* b) { return ((b[0] & 1) ? 8 : 0) | (b[2] & 7); };
+	auto is_disp8 = [](const uint8_t* b) { return (b[2] & 0xC0) == 0x40 && (b[2] & 7) != 4; };
+	auto is_disp32 = [](const uint8_t* b) { return (b[2] & 0xC0) == 0x80 && (b[2] & 7) != 4; };
+	auto rip_target = [](const uint8_t* b) { int32_t d; memcpy(&d, b + 3, 4); return (uintptr_t)b + 7 + (intptr_t)d; };
+
+	// mov r1,[rip+disp32] (7バイト) / mov r2,[r1+disp8] (4バイト) / mov r3,[r2+disp8] (4バイト) が続く所を探す
+	for (uintptr_t p = func; p + 15 <= lea; p++) {
+		const uint8_t* a = (const uint8_t*)p;
+		const uint8_t* b = a + 7;
+		const uint8_t* c = a + 11;
+		if (!is_mov(a) || !is_rip(a)) continue;
+		if (!is_mov(b) || !is_disp8(b) || base_of(b) != reg_of(a)) continue;
+		if (!is_mov(c) || !is_disp8(c) || base_of(c) != reg_of(b)) continue;
+		g_undo.service_slot = rip_target(a);
+		g_undo.hist_off = (int8_t)b[3];
+		g_undo.pos_off = (int8_t)c[3];
+		break;
 	}
-	sc.vk = key_name_to_vk(rest);
-	sc.valid = sc.vk != 0;
-	return sc;
+	if (!g_undo.service_slot) return locate_undo_fail(L"Undo履歴の場所を読み取れない");
+	if (g_undo.service_slot < data.start || g_undo.service_slot >= data.end || g_undo.pos_off < 0x20 || (g_undo.pos_off & 7) ||
+		g_undo.hist_off < 0 || (g_undo.hist_off & 7)) {
+		return locate_undo_fail(L"Undo履歴の場所が想定と違う");
+	}
+
+	// 今のシーン: mov r1,[rip+X] の後に、r1を土台にした mov r,[r1+D] と mov r,[r1+D-8] (shared_ptr<Scene>の制御ブロックと本体) がある所。
+	// レイヤーの番号を求めるのに使う (見つからなければレイヤーの番号を出さない)
+	for (uintptr_t p = lea; p + 7 <= func_end && !g_undo.editor_slot; p++) {
+		const uint8_t* a = (const uint8_t*)p;
+		if (!is_mov(a) || !is_rip(a)) continue;
+		int r = reg_of(a);
+		std::set<int32_t> disps;
+		for (uintptr_t q = p + 7; q + 7 <= std::min(func_end, p + 120); q++) {
+			const uint8_t* b = (const uint8_t*)q;
+			if (!is_mov(b) || !is_disp32(b) || base_of(b) != r) continue;
+			int32_t d;
+			memcpy(&d, b + 3, 4);
+			disps.insert(d);
+		}
+		for (int32_t d : disps) {
+			if (d >= 8 && disps.count(d - 8) && rip_target(a) >= data.start && rip_target(a) < data.end) {
+				g_undo.editor_slot = rip_target(a);
+				g_undo.scene_off = d - 8;
+				break;
+			}
+		}
+	}
+
+	// RTTIから仮想関数表を探す。
+	// 型情報(TypeDescriptor)は .data にあり、クラス名は先頭から0x10の位置。
+	// Complete Object Locator(.rdata): +0 signature(1) / +0x0C 型情報のRVA / +0x14 自身のRVA。仮想関数表の直前の8バイトがCOLを指す
+	for (int k = 1; k < UK_COUNT; k++) {
+		const char* name = KIND_RTTI[k];
+		uintptr_t td_name = find_bytes(data, name, strlen(name) + 1);
+		if (!td_name) continue;	// その種類が無い版もありうる
+		DWORD td_rva = (DWORD)(td_name - 0x10 - base);
+		for (uintptr_t p = rdata.start + 12; p + 12 <= rdata.end; p += 4) {
+			if (*(const DWORD*)p != td_rva) continue;
+			uintptr_t col = p - 12;
+			if (*(const DWORD*)col != 1 || *(const DWORD*)(col + 4) != 0 || *(const DWORD*)(col + 20) != (DWORD)(col - base)) continue;
+			for (uintptr_t q = rdata.start; q + 16 <= rdata.end; q += 8) {
+				if (*(const uint64_t*)q == (uint64_t)col) g_undo.vtables[q + 8] = (UndoKind)k;
+			}
+		}
+	}
+	std::set<int> found;
+	for (auto& [vt, kind] : g_undo.vtables) found.insert(kind);
+	if (!found.count(UK_OBJECT_UPDATE) || !found.count(UK_EFFECT_UPDATE)) return locate_undo_fail(L"Undoの項目の種類が見つからない");
+	g_undo.ok = true;
+	return true;
 }
 
-void read_shortcuts() {
-	g_undo_id = find_menu_id(UNDO_NAMES);
-	g_redo_id = find_menu_id(REDO_NAMES);
-	g_undo_key = read_shortcut(UNDO_NAMES);
-	g_redo_key = read_shortcut(REDO_NAMES);
-	g_group_id = find_menu_id(GROUP_NAMES);
-	g_ungroup_id = find_menu_id(UNGROUP_NAMES);
-	g_group_key = read_shortcut(GROUP_NAMES);
-	g_ungroup_key = read_shortcut(UNGROUP_NAMES);
+// 本体の履歴の写し (段は古い順)
+struct UndoSnapshot {
+	uintptr_t hist = 0;
+	size_t pos = 0;		// Undoした回数
+	std::vector<std::vector<uintptr_t>> steps;
+};
+
+// 本体の履歴の目印 (今のシーンの履歴・段の数・Undoした回数・最新の段の最初の項目)。
+// 古い側の段は上限で捨てられる以外に変わらないので、これが同じなら履歴は変わっていない。全段を読む前にこれだけ比べる
+struct UndoKey {
+	uintptr_t hist = 0;
+	uint64_t size = 0, pos = 0;
+	uintptr_t newest = 0;
+};
+
+bool read_undo_key(UndoKey& k) {
+	uintptr_t service = 0;
+	if (!g_undo.ok || !read_mem(g_undo.service_slot, service) || !service) return false;
+	if (!read_mem(service + g_undo.hist_off, k.hist) || !k.hist) return false;
+	uint64_t map = 0, map_size = 0, off = 0;
+	int p = g_undo.pos_off;
+	if (!read_mem(k.hist + p - 0x20, map) || !read_mem(k.hist + p - 0x18, map_size) || !read_mem(k.hist + p - 0x10, off) ||
+		!read_mem(k.hist + p - 0x08, k.size) || !read_mem(k.hist + p, k.pos)) return false;
+	if (!k.size) return true;
+	if (!map || !map_size || (map_size & (map_size - 1))) return false;
+	uintptr_t block = 0, first = 0;	// 段[0](一番新しい段)のstd::vector<UndoItem*>の先頭
+	if (!read_mem(map + 8 * (off & (map_size - 1)), block) || !read_mem(block, first)) return false;
+	return !first || read_mem(first, k.newest);
 }
 
-extern HWND g_hwnd;
+bool read_undo_snapshot(UndoSnapshot& s) {
+	uintptr_t service = 0;
+	if (!g_undo.ok || !read_mem(g_undo.service_slot, service) || !service) return false;
+	if (!read_mem(service + g_undo.hist_off, s.hist) || !s.hist) return false;
+	uint64_t map = 0, map_size = 0, off = 0, size = 0, pos = 0;
+	int p = g_undo.pos_off;
+	if (!read_mem(s.hist + p - 0x20, map) || !read_mem(s.hist + p - 0x18, map_size) || !read_mem(s.hist + p - 0x10, off) ||
+		!read_mem(s.hist + p - 0x08, size) || !read_mem(s.hist + p, pos)) return false;
+	if (size > 100000 || pos > size) return false;
+	if (size && (!map || !map_size || (map_size & (map_size - 1)))) return false;
+	s.pos = (size_t)pos;
+	s.steps.assign((size_t)size, {});
+	for (uint64_t i = 0; i < size; i++) {
+		uintptr_t block = 0;
+		if (!read_mem(map + 8 * ((off + i) & (map_size - 1)), block)) return false;
+		uintptr_t vec[2] = {};	// std::vector<UndoItem*>の先頭・末尾
+		if (!safe_copy(vec, block, sizeof(vec)) || vec[1] < vec[0] || ((vec[1] - vec[0]) & 7) || (vec[1] - vec[0]) / 8 > 100000) return false;
+		auto& items = s.steps[(size_t)(size - 1 - i)];	// 段[0]が一番新しいので、古い順に並べ替える
+		items.resize((vec[1] - vec[0]) / 8);
+		if (!items.empty() && !safe_copy(items.data(), vec[0], items.size() * 8)) return false;
+	}
+	return true;
+}
+
+// オブジェクト(仮想関数表を持つもの)の種類
+UndoKind kind_of(uintptr_t object) {
+	uintptr_t vt = 0;
+	if (!read_mem(object, vt)) return UK_UNKNOWN;
+	auto it = g_undo.vtables.find(vt);
+	return it == g_undo.vtables.end() ? UK_UNKNOWN : it->second;
+}
+
+uintptr_t item_target(uintptr_t item) { return read_or<uintptr_t>(item + 8, 0); }
+
+// オブジェクトのエフェクトの並び
+std::vector<uintptr_t> effect_list(uintptr_t list_addr) {
+	std::vector<uintptr_t> out;
+	for (auto& sp : read_vector<std::pair<uintptr_t, uintptr_t>>(list_addr)) out.push_back(sp.first);
+	return out;
+}
+
+std::vector<std::wstring> effect_names(const std::vector<uintptr_t>& effects) {
+	std::vector<std::wstring> names;
+	for (uintptr_t e : effects) names.push_back(read_cstr(read_or<uintptr_t>(e + EFFECT_NAME, 0)));
+	return names;
+}
+
+// [Lレイヤー] とオブジェクトの表示名 (名前が付いていればその名前、無ければ最初のエフェクト名)
+std::wstring object_title(uintptr_t obj, int layer, const std::wstring& name) {
+	std::wstring title = name;
+	if (title.empty()) {
+		auto names = effect_names(effect_list(obj + OBJ_EFFECTS));
+		if (!names.empty()) title = names[0];
+	}
+	return L"[L" + std::to_wstring(layer + 1) + L"]" + (title.empty() ? L"オブジェクト" : title);
+}
+
+std::wstring object_title(uintptr_t obj) {
+	return object_title(obj, read_or<int>(obj + OBJ_LAYER, 0), read_wstring(obj + OBJ_NAME));
+}
+
+ObjPos object_pos(uintptr_t obj) {
+	return { read_or<int>(obj + OBJ_LAYER, 0), read_or<int>(obj + OBJ_START, 0), read_or<int>(obj + OBJ_END, 0) };
+}
+
+// レイヤー(Layer*)の番号 (今のシーンから探す。見つからなければ-1)
+int layer_index(uintptr_t layer) {
+	if (!g_undo.editor_slot) return -1;
+	uintptr_t editor = read_or<uintptr_t>(g_undo.editor_slot, 0);
+	uintptr_t scene = editor ? read_or<uintptr_t>(editor + g_undo.scene_off, 0) : 0;
+	if (!scene) return -1;
+	auto slots = read_vector<uintptr_t>(scene + SCENE_LAYERS);
+	for (size_t i = 0; i < slots.size(); i++) {
+		if (read_or<uintptr_t>(slots[i] + LAYER_SLOT_LAYER, 0) == layer) return (int)i;
+	}
+	return -1;
+}
+
+// 色リストの色
+struct ListColor {
+	uint32_t color = 0;	// 0xAABBGGRR
+	float pos = 0;
+	bool operator==(const ListColor& o) const { return color == o.color && pos == o.pos; }
+	bool operator!=(const ListColor& o) const { return !(*this == o); }
+};
+
+std::vector<ListColor> read_color_list(uintptr_t item) {
+	struct Raw { uint32_t color; float pos; uint32_t reserved; };
+	std::vector<ListColor> out;
+	for (auto& r : read_vector<Raw>(item + COLORLIST_COLORS)) out.push_back({ r.color, r.pos });
+	return out;
+}
+
+std::vector<std::wstring> read_color_list_names(uintptr_t item) {
+	uintptr_t vec[2] = {};
+	std::vector<std::wstring> out;
+	if (!safe_copy(vec, item + COLORLIST_NAMES, sizeof(vec)) || vec[1] < vec[0] || (vec[1] - vec[0]) / 0x20 > 1000) return out;
+	for (uintptr_t p = vec[0]; p + 0x20 <= vec[1]; p += 0x20) out.push_back(read_wstring(p));
+	return out;
+}
+
+// 色リストを文字列にして持つ (まとめた行の説明を作り直すため)。「AABBGGRR/位置」をカンマで並べる
+std::string encode_color_list(const std::vector<ListColor>& list) {
+	std::string s;
+	for (auto& c : list) {
+		char buf[48];
+		sprintf_s(buf, "%s%08x/%g", s.empty() ? "" : ",", c.color, c.pos);
+		s += buf;
+	}
+	return s;
+}
+
+std::vector<ListColor> decode_color_list(const std::string& s) {
+	std::vector<ListColor> out;
+	size_t pos = 0;
+	while (pos < s.size()) {
+		size_t comma = s.find(',', pos);
+		std::string t = s.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+		ListColor c;
+		unsigned int color = 0;
+		if (sscanf_s(t.c_str(), "%x/%f", &color, &c.pos) == 2) { c.color = color; out.push_back(c); }
+		if (comma == std::string::npos) break;
+		pos = comma + 1;
+	}
+	return out;
+}
+
+// 色の表示 (rrggbb。不透明でなければ透明度の16進を後ろに付ける)
+std::wstring color_text(uint32_t c) {
+	wchar_t buf[16];
+	if ((c >> 24) == 0xff) swprintf_s(buf, L"%02x%02x%02x", c & 0xff, (c >> 8) & 0xff, (c >> 16) & 0xff);
+	else swprintf_s(buf, L"%02x%02x%02x%02x", c & 0xff, (c >> 8) & 0xff, (c >> 16) & 0xff, c >> 24);
+	return buf;
+}
+
+// 色リストの変化を説明する (変わった色だけを名前で出す)
+std::wstring describe_color_list(const std::vector<std::wstring>& names, const std::vector<ListColor>& a, const std::vector<ListColor>& b) {
+	auto name = [&](size_t i) {
+		if (i < names.size() && !names[i].empty()) return names[i];
+		return (names.empty() ? std::wstring(L"色") : names.back()) + L"(" + std::to_wstring(i + 1) + L")";
+	};
+	auto pos_text = [](float p) { wchar_t buf[32]; swprintf_s(buf, L"%g", p); return std::wstring(buf); };
+	// 1色の追加・削除: 多い方から1つ抜くと少ない方と一致するもの (同じ色が並ぶ時は後ろから探す)
+	if (a.size() + 1 == b.size() || b.size() + 1 == a.size()) {
+		const auto& longer = a.size() > b.size() ? a : b;
+		const auto& shorter = a.size() > b.size() ? b : a;
+		for (size_t i = longer.size(); i-- > 0;) {
+			auto r = longer;
+			r.erase(r.begin() + i);
+			if (r == shorter) return b.size() > a.size() ? name(i) + L" を追加 (" + color_text(longer[i].color) + L")" : name(i) + L" を削除";
+		}
+	}
+	if (a.size() != b.size()) return L"色の数 " + std::to_wstring(a.size()) + L"→" + std::to_wstring(b.size());
+	std::vector<std::wstring> texts;
+	for (size_t i = 0; i < a.size(); i++) {
+		if (a[i].color != b[i].color) texts.push_back(name(i) + L" " + color_text(a[i].color) + L"→" + color_text(b[i].color));
+		if (a[i].pos != b[i].pos) texts.push_back(name(i) + L" の位置 " + pos_text(a[i].pos) + L"→" + pos_text(b[i].pos));
+	}
+	if (texts.empty()) return L"色リストを変更";
+	if (texts.size() > 2) return std::to_wstring(texts.size()) + L"箇所の色を変更";
+	std::wstring text;
+	for (size_t i = 0; i < texts.size(); i++) text += (i ? L", " : L"") + texts[i];
+	return text;
+}
+
+// 選択肢の表(std::map<int, const wchar_t*>)から番号の名前を探す (見つからなければ空)
+// std::mapの節: +0 左 / +8 親 / +0x10 右 / +0x19 番兵か / +0x20 キー / +0x28 値。表の+0が番兵(+8が根)
+std::wstring select_option_name(uintptr_t options, int index) {
+	uintptr_t head = read_or<uintptr_t>(options, 0);
+	if (!head) return L"";
+	uintptr_t node = read_or<uintptr_t>(head + 8, 0);
+	for (int depth = 0; depth < 64 && node && node != head && !read_or<uint8_t>(node + 0x19, 1); depth++) {
+		int key = read_or<int>(node + 0x20, 0);
+		if (key == index) return read_cstr(read_or<uintptr_t>(node + 0x28, 0));
+		node = read_or<uintptr_t>(node + (index < key ? 0 : 0x10), 0);
+	}
+	return L"";
+}
+
+// 設定項目の値をエイリアスと同じ書式にする (分からない種類はfalse)
+bool item_value_text(uintptr_t item, std::string& out) {
+	switch (kind_of(item)) {
+	case UK_ITEM_NUMBER: {
+		auto values = read_vector<int>(item + NUMBER_VALUES);
+		int denominator = read_or<int>(item + NUMBER_DENOMINATOR, 1);
+		if (values.empty() || denominator <= 0) return false;
+		int digits = 0;
+		for (int d = denominator; d >= 10; d /= 10) digits++;
+		auto number = [&](int v) {
+			char buf[64];
+			sprintf_s(buf, "%.*f", digits, (double)v / denominator);
+			return std::string(buf);
+		};
+		uintptr_t move = read_or<uintptr_t>(item + NUMBER_MOVE, 0);
+		int param = read_or<int>(item + NUMBER_PARAM, 0);
+		bool no_move = !move || kind_of(move) == UK_NO_MOVE;
+		if (no_move && !(param & TRACK_PARAM_EXPRESSION)) {
+			out = number(values[0]);
+			return true;
+		}
+		out.clear();
+		for (size_t i = 0; i < values.size(); i++) out += (i ? "," : "") + number(values[i]);
+		std::wstring move_name = move ? read_cstr(read_or<uintptr_t>(move + 8, 0)) : L"";
+		out += "," + wide_to_utf8(move_name.empty() ? L"移動無し" : move_name) + "," + std::to_string(param);
+		if (param & TRACK_PARAM_EXPRESSION) out += "|" + wide_to_utf8(read_wstring(item + NUMBER_EXPRESSION));
+		return true;
+	}
+	case UK_ITEM_CHECK:
+		out = read_or<uint8_t>(item + ITEM_VALUE, 0) ? "1" : "0";
+		return true;
+	case UK_ITEM_SELECT: {
+		std::wstring name = select_option_name(read_or<uintptr_t>(item + SELECT_OPTIONS, 0), read_or<int>(item + SELECT_INDEX, -1));
+		if (name.empty()) return false;
+		out = wide_to_utf8(name);
+		return true;
+	}
+	case UK_ITEM_COLOR: {
+		uint32_t c = read_or<uint32_t>(item + ITEM_VALUE, 0);
+		char buf[16];
+		sprintf_s(buf, "%02x%02x%02x", c & 0xff, (c >> 8) & 0xff, (c >> 16) & 0xff);
+		out = buf;
+		return true;
+	}
+	default:
+		return false;
+	}
+}
+
+//=======================================================================
+//	段の説明 (Undoの項目の変更前・変更後の状態から作る)
+//=======================================================================
+
+// 段が最新の状態の時に説明しているか (最新なら、本体にある今の値がその段の変更後の値)
+bool g_describe_latest = false;
+
+// 種類の分からない設定項目(選択・ファイル・フォント等)は、最新の段なら変更後の値をSDKで読み、変更前の値は前に読んだ値を使う
+// (EFFECT_HANDLEはEffectBase*と同じ値。持ち主のオブジェクトのエフェクトの並びに含まれるかを確かめてから使う)
+std::map<std::pair<uintptr_t, std::wstring>, std::string> g_item_value_cache;
+
+bool sdk_item_value(uintptr_t effect, const std::wstring& item, std::string& out) {
+	uintptr_t owner = read_or<uintptr_t>(effect + EFFECT_OWNER, 0);
+	if (!owner || !edit_handle) return false;
+	struct Param { uintptr_t effect, owner; const std::wstring* item; std::string value; bool ok; } param = { effect, owner, &item, "", false };
+	edit_handle->call_read_section_param(&param, [](void* p, EDIT_SECTION* edit) {
+		auto* q = (Param*)p;
+		EFFECT_HANDLE list[64] = {};
+		int n = edit->get_effect_list((OBJECT_HANDLE)q->owner, list, 64);
+		bool found = false;
+		for (int i = 0; i < n && i < 64; i++) if ((uintptr_t)list[i] == q->effect) found = true;
+		if (!found) return;
+		LPCSTR v = edit->get_effect_item_value((EFFECT_HANDLE)q->effect, q->item->c_str());
+		if (v) { q->value = v; q->ok = true; }
+	});
+	if (param.ok) out = param.value;
+	return param.ok;
+}
+
+// 1つのオブジェクトへの変化 (同じ段の項目をオブジェクトごとにまとめる)
+struct ObjDelta {
+	uintptr_t obj = 0;
+	bool created = false, deleted = false;
+	int created_layer = 0, deleted_layer = 0;	// 追加した・削除したオブジェクトのレイヤー (削除した後のオブジェクトはレイヤーを持たない)
+	bool has_pos = false;
+	ObjPos pos_before, pos_after;
+	std::wstring name_before, name_after;
+	bool has_flags = false;
+	uint32_t flags_before = 0, flags_after = 0;
+	bool has_sections = false;
+	std::vector<int> sections_before, sections_after;
+	bool has_effects = false;
+	std::vector<uintptr_t> effects_before, effects_after;
+	std::vector<uintptr_t> effect_items;	// EffectUndoUpdateの項目
+};
+
+// エフェクトの設定項目・表示・ロックの変化を説明する。
+// 文字列の項目への入力・時間制御の編集・数値の値だけの変更なら、まとめるための情報をeに入れる
+void describe_effect_items(const ObjDelta& d, std::wstring title, std::vector<std::wstring>& changes, Entry& e, bool single) {
+	auto effects = effect_list(d.obj + OBJ_EFFECTS);
+	auto names = effect_names(effects);
+	int lock_on = 0, lock_off = 0, hide_on = 0, hide_off = 0, other = 0;
+	bool hide_first = false;
+	std::vector<std::wstring> texts;
+	std::vector<ValueChange> value_changes;	// 値だけの変更 (数値・選択等・色リスト)
+	bool values_only = true;
+	std::wstring value_effect;
+	int value_effect_count = 0;
+	std::string text_key, timectl_key;
+	int text_count = 0, timectl_count = 0;
+	for (uintptr_t item : d.effect_items) {
+		uintptr_t effect = item_target(item);
+		size_t index = std::find(effects.begin(), effects.end(), effect) - effects.begin();
+		std::wstring label = effect_display_name(names, index);
+		std::wstring effect_name = index < names.size() ? names[index] : read_cstr(read_or<uintptr_t>(effect + EFFECT_NAME, 0));
+		uint8_t hide_a = read_or<uint8_t>(item + EFFECT_ITEMS_BEFORE + 0x18, 0), hide_b = read_or<uint8_t>(item + EFFECT_ITEMS_AFTER + 0x18, 0);
+		uint8_t lock_a = read_or<uint8_t>(item + EFFECT_ITEMS_BEFORE + 0x19, 0), lock_b = read_or<uint8_t>(item + EFFECT_ITEMS_AFTER + 0x19, 0);
+		std::vector<std::pair<std::wstring, std::wstring>> items;	// このエフェクトで変わった項目名と説明
+		if (lock_a != lock_b) {
+			items.push_back({ L"", lock_b ? L"をロック" : L"のロックを解除" });
+			(lock_b ? lock_on : lock_off)++;
+		}
+		if (hide_a != hide_b) {
+			items.push_back({ L"", hide_b ? L"を非表示" : L"を表示" });
+			(hide_b ? hide_on : hide_off)++;
+			if (index == 0) hide_first = true;
+		}
+		auto before = read_vector<uintptr_t>(item + EFFECT_ITEMS_BEFORE);
+		auto after = read_vector<uintptr_t>(item + EFFECT_ITEMS_AFTER);
+		std::wstring timectl_items;
+		for (size_t j = 0; j < after.size(); j++) {
+			uintptr_t cb = j < before.size() ? before[j] : 0, ca = after[j];
+			if (!ca) continue;
+			std::wstring key = read_wstring(ca + ITEM_NAME);
+			UndoKind type = kind_of(ca);
+			std::string va, vb;
+			bool known = item_value_text(ca, vb) && cb && item_value_text(cb, va);
+			if (type == UK_ITEM_TEXT || type == UK_ITEM_STRING) {
+				// 入力後の内容を出す (1文字ずつの項目を表示上まとめた行でも、最後の項目のラベルがそのまま使える)。
+				// 段が持つのは削除・挿入した文字列だけなので、最新の段なら今の全文をSDKで読み、そうでなければ挿入・削除した文字列を出す
+				std::wstring head = effect_name == L"テキスト" && key == L"テキスト" ? L"テキスト" : label + L" " + key + L" ";
+				std::string full;
+				std::wstring text;
+				std::wstring inserted = read_wstring(ca + ITEM_VALUE), removed = cb ? read_wstring(cb + ITEM_VALUE) : L"";
+				e.has_text = true;
+				e.text_head = title + L" " + head;
+				e.text_pos = read_or<int>(ca + TEXT_POSITION, 0);
+				e.text_inserted = inserted;
+				e.text_removed = removed;
+				e.text_full_known = g_describe_latest && sdk_item_value(effect, key, full);
+				e.text_after = utf8_to_wide(full);
+				if (e.text_full_known) {
+					text = shorten(e.text_after);
+				} else {
+					text = (removed.empty() ? L"" : L"-" + shorten(removed)) + (inserted.empty() ? L"" : L"+" + shorten(inserted));
+				}
+				texts.push_back(head + L"入力 (" + text + L")");
+				text_count++;
+				text_key = "\x1f" + std::to_string(index) + "\x1f" + wide_to_utf8(key);
+				values_only = false;
+				continue;
+			}
+			if (type == UK_ITEM_COLOR_LIST) {
+				// 色リスト: 変わった色だけを名前で出す
+				if (!cb) continue;
+				auto list_a = read_color_list(cb), list_b = read_color_list(ca);
+				auto list_names = read_color_list_names(ca);
+				items.push_back({ L"", describe_color_list(list_names, list_a, list_b) });
+				// 色の追加・削除はまとめない (後の色の変更が追加の説明に吸収されて見えなくなるため)。
+				// 色・位置の変更は、同じ色の同じ変更(色か位置か)が続く時だけまとめる
+				if (list_a.size() != list_b.size()) {
+					values_only = false;
+					continue;
+				}
+				std::string sub;
+				for (size_t i = 0; i < list_a.size(); i++) {
+					if (list_a[i].color != list_b[i].color) sub += "c" + std::to_string(i) + ",";
+					if (list_a[i].pos != list_b[i].pos) sub += "p" + std::to_string(i) + ",";
+				}
+				value_changes.push_back({ item_group_head(effect_name, key) + L"\x1f" + key, encode_color_list(list_a), encode_color_list(list_b),
+					VALUE_COLOR_LIST, list_names, sub });
+				continue;
+			}
+			std::wstring desc;
+			bool other_value = false;	// 選択等の値をSDKで読めた
+			std::string other_before, other_after;
+			if (known) {
+				desc = describe_value_change(va, vb);
+			} else {
+				// 種類の分からない項目: 変更後の値をSDKで読む (変更前は前に読んだ値があれば使う)
+				std::string now;
+				auto cache_key = std::make_pair(effect, key);
+				if (g_describe_latest && sdk_item_value(effect, key, now)) {
+					auto it = g_item_value_cache.find(cache_key);
+					other_before = it != g_item_value_cache.end() && it->second != now ? it->second : "";
+					other_after = now;
+					other_value = true;
+					desc = other_before.empty() ? L" を " + shorten(utf8_to_wide(now)) + L" に変更" : describe_value_change(other_before, now);
+					g_item_value_cache[cache_key] = now;
+				} else {
+					desc = L" を変更";
+				}
+			}
+			// 移動方法の適用・時間制御の編集等、値を含まない同じ説明が続く時は「X,Y,Z に 直線移動 を適用」とまとめる
+			bool merged = false;
+			if (desc.find(L'→') == std::wstring::npos) {
+				for (auto& [k, dsc] : items) {
+					if (!k.empty() && dsc == desc) { k += L"," + key; merged = true; break; }
+				}
+			}
+			if (!merged) items.push_back({ key, desc });
+			if (desc == L" の時間制御を編集") timectl_items += key + L",";
+			// 数値の値だけの変更か (移動方法・設定・参照式の数が変わらない)
+			TrackValue ta = parse_track(va), tb = parse_track(vb);
+			bool value_only = known && type == UK_ITEM_NUMBER && desc.find(L'→') != std::wstring::npos && ta.track == tb.track &&
+				ta.move == tb.move && ta.param == tb.param && ta.expression == tb.expression && ta.values.size() == tb.values.size();
+			if (value_only) value_changes.push_back({ item_group_head(effect_name, key) + L"\x1f" + key, va, vb });
+			else if (known && type == UK_ITEM_SELECT) value_changes.push_back({ item_group_head(effect_name, key) + L"\x1f" + key, va, vb, VALUE_OTHER });
+			else if (other_value) value_changes.push_back({ item_group_head(effect_name, key) + L"\x1f" + key, other_before, other_after, VALUE_OTHER });
+			else values_only = false;
+		}
+		if (items.empty()) continue;
+		if (items.size() == 1 && items[0].second == L" の時間制御を編集") {
+			timectl_count++;
+			timectl_key = "\x1e" + std::to_string(index) + "\x1f" + wide_to_utf8(timectl_items);
+		}
+		if (lock_a != lock_b || hide_a != hide_b) values_only = false;
+		if (items.size() > (size_t)((lock_a != lock_b) + (hide_a != hide_b))) other++;
+		std::wstring text = label + L" ";
+		for (size_t j = 0; j < items.size(); j++) text += (j ? L", " : L"") + items[j].first + items[j].second;
+		texts.push_back(text);
+		value_effect = label;
+		value_effect_count++;
+	}
+	// オブジェクト自体のロックは、オブジェクト本体(最初のエフェクト)と標準描画等のロックが一度に変わる。
+	// 2つ以上のエフェクトのロックだけが同じ向きに変わったら、オブジェクトのロックとして1件にする
+	if (!other && !text_count && lock_on + lock_off >= 2 && !hide_on && !hide_off && (lock_on == 0 || lock_off == 0)) {
+		changes.push_back(lock_on ? L"をロック" : L"のロックを解除");
+		return;
+	}
+	// オブジェクト本体の表示/非表示、または複数のエフェクトが一度に変わった場合はオブジェクトの表示/非表示とする
+	if (!other && !text_count && !lock_on && !lock_off && (hide_first || hide_on + hide_off >= 2) && (hide_on == 0 || hide_off == 0)) {
+		changes.push_back(hide_on ? L"を非表示" : L"を表示");
+		return;
+	}
+	for (auto& t : texts) changes.push_back(t);
+	if (!single || texts.size() != 1) return;
+	// まとめるための情報 (1つのオブジェクトの1つのエフェクトだけが変わった時)
+	e.merge_object = d.obj;
+	if (text_count == 1) {
+		e.merge_key = text_key;
+	} else if (timectl_count == 1) {
+		e.merge_key = timectl_key;
+	} else if (values_only && !value_changes.empty() && value_effect_count == 1) {
+		// 同じグループ(X,Y,Z等)の項目はグループで数える (「X,Yの変更」と「Xだけの変更」を同じパラメータとしてまとめる)
+		std::set<std::wstring> groups;
+		for (auto& v : value_changes) groups.insert(v.item.substr(0, v.item.find(L'\x1f')));
+		e.merge_key = "\x1d" + wide_to_utf8(value_effect);
+		for (auto& g : groups) e.merge_key += "\x1f" + wide_to_utf8(g);
+		for (auto& v : value_changes) if (!v.merge_sub.empty()) e.merge_key += "\x1f" + v.merge_sub;
+		e.merge_prefix = title + L" " + value_effect + L" ";
+		e.values = value_changes;
+	} else {
+		e.merge_object = 0;
+	}
+}
+
+// 1つのオブジェクトの変化を説明する
+std::wstring describe_object(const ObjDelta& d, Entry& e, bool single) {
+	if (d.created) return object_title(d.obj, d.created_layer, read_wstring(d.obj + OBJ_NAME)) + L" を追加 (" + time_text(read_or<int>(d.obj + OBJ_START, 0)) + L")";
+	if (d.deleted) return object_title(d.obj, d.deleted_layer, read_wstring(d.obj + OBJ_NAME)) + L" を削除";
+	ObjPos pos = d.has_pos ? d.pos_before : object_pos(d.obj);
+	std::wstring title = object_title(d.obj, pos.layer, d.has_pos ? d.name_before : read_wstring(d.obj + OBJ_NAME));
+	std::wstring position = d.has_pos ? describe_position_change(d.pos_before, d.pos_after) : L"";
+	std::vector<std::wstring> changes;
+	if (d.has_sections) {
+		// 中間点の追加・削除では各設定項目の値の並びも変わるので、設定の変更としては出さない
+		std::wstring s = describe_section_change(d.sections_before, d.has_pos ? d.pos_before.start : pos.start,
+			d.sections_after, d.has_pos ? d.pos_after.start : pos.start);
+		if (!s.empty()) return title + L" " + s + (position.empty() ? L"" : L" / " + position);
+	}
+	if (d.has_pos && d.name_before != d.name_after) {
+		changes.push_back(L"の名前を変更 (" + (d.name_before.empty() ? L"なし" : shorten(d.name_before)) + L"→" +
+			(d.name_after.empty() ? L"なし" : shorten(d.name_after)) + L")");
+	}
+	if (d.has_flags) {
+		struct Flag { int byte; const wchar_t* on; const wchar_t* off; };
+		static const Flag flags[] = {
+			{ 0, L"のクリッピングを有効化", L"のクリッピングを解除" },
+			{ 3, L"の上のオブジェクトでクリッピングを有効化", L"の上のオブジェクトでクリッピングを解除" },
+			{ 1, L"をカメラ制御の対象にする", L"をカメラ制御の対象から外す" },
+			{ 2, L"をグループ制御の対象にする", L"をグループ制御の対象から外す" },
+		};
+		std::vector<std::wstring> texts;
+		for (auto& f : flags) {
+			bool a = (d.flags_before >> (f.byte * 8)) & 0xff, b = (d.flags_after >> (f.byte * 8)) & 0xff;
+			if (a != b) texts.push_back(b ? f.on : f.off);
+		}
+		// クリッピングを有効にすると本体がカメラ制御の対象から外すので、それは別に出さない
+		if (texts.size() == 2 && texts[0] == flags[0].on && texts[1] == flags[2].off) texts.pop_back();
+		for (auto& t : texts) changes.push_back(t);
+	}
+	if (d.has_effects) {
+		// 追加・削除はエフェクトそのもの(EffectBase*)で見分ける (同じ名前のエフェクトが並んでいても、どれかが分かる)
+		auto na = effect_names(d.effects_before), nb = effect_names(d.effects_after);
+		std::vector<size_t> added, removed;
+		for (size_t i = 0; i < d.effects_after.size(); i++) {
+			if (std::find(d.effects_before.begin(), d.effects_before.end(), d.effects_after[i]) == d.effects_before.end()) added.push_back(i);
+		}
+		for (size_t i = 0; i < d.effects_before.size(); i++) {
+			if (std::find(d.effects_after.begin(), d.effects_after.end(), d.effects_before[i]) == d.effects_after.end()) removed.push_back(i);
+		}
+		std::wstring s;
+		if (added.size() == 1 && removed.empty()) s = effect_display_name(nb, added[0]) + L" を追加";
+		else if (removed.size() == 1 && added.empty()) s = effect_display_name(na, removed[0]) + L" を削除";
+		else s = describe_effect_list_change(na, nb);
+		if (!s.empty()) changes.push_back(s);
+	}
+	bool effect_items_only = !d.has_pos && !d.has_flags && !d.has_effects && !d.has_sections;
+	if (!d.effect_items.empty()) describe_effect_items(d, title, changes, e, single && effect_items_only);
+	if (single && changes.empty() && !position.empty()) {
+		// 位置だけの変更: 同じオブジェクトの移動・長さの変更が続く行をまとめる
+		e.merge_object = d.obj;
+		bool same_length = (d.pos_before.end - d.pos_before.start) == (d.pos_after.end - d.pos_after.start);
+		e.merge_key = same_length ? "\x1c移動" : "\x1c長さ";
+		e.merge_prefix = title + L" ";
+		e.values = { { L"", d.pos_before.text(), d.pos_after.text() } };
+	}
+	std::wstring content;
+	if (!changes.empty()) content = changes[0] + (changes.size() > 1 ? L" 他" + std::to_wstring(changes.size() - 1) + L"件" : L"");
+	if (!position.empty() && !content.empty()) return title + L" " + position + L" / " + content;
+	if (!position.empty()) return title + L" " + position;
+	if (!content.empty()) return title + L" " + content;
+	return title + L" を変更";
+}
+
+// 複数のオブジェクトの分割・移動・長さの変更を1件にまとめた説明 (当てはまらなければ空)
+std::wstring describe_multi_objects(const std::vector<ObjDelta>& list) {
+	// 分割: 同じレイヤーで、変化の前の区間 [s, e] が、変化の後の区間 [s, m-1] [m, e] の2つに分かれた
+	std::vector<std::pair<ObjPos, uintptr_t>> before, after;
+	bool positions_only = true;
+	for (auto& d : list) {
+		ObjPos p = object_pos(d.obj);
+		if (d.deleted) before.push_back({ { d.deleted_layer, p.start, p.end }, d.obj });
+		else if (d.created) after.push_back({ { d.created_layer, p.start, p.end }, d.obj });
+		else if (d.has_pos) { before.push_back({ d.pos_before, d.obj }); after.push_back({ d.pos_after, d.obj }); }
+		if (d.created || d.deleted || !d.has_pos || d.has_flags || d.has_effects || d.has_sections || !d.effect_items.empty() ||
+			d.name_before != d.name_after) positions_only = false;
+	}
+	if (!before.empty() && after.size() == before.size() * 2) {
+		std::vector<bool> used(after.size(), false);
+		std::vector<int> points;
+		for (auto& [b, obj] : before) {
+			int first = -1, second = -1;
+			for (size_t i = 0; i < after.size() && first < 0; i++) {
+				const ObjPos& a = after[i].first;
+				if (!used[i] && a.layer == b.layer && a.start == b.start && a.end < b.end) first = (int)i;
+			}
+			if (first < 0) break;
+			for (size_t i = 0; i < after.size() && second < 0; i++) {
+				const ObjPos& a = after[i].first;
+				if (!used[i] && (int)i != first && a.layer == b.layer && a.start == after[first].first.end + 1 && a.end == b.end) second = (int)i;
+			}
+			if (second < 0) break;
+			used[first] = used[second] = true;
+			points.push_back(after[second].first.start);
+		}
+		if (points.size() == before.size()) {
+			bool same_point = std::all_of(points.begin(), points.end(), [&](int f) { return f == points[0]; });
+			std::wstring at = same_point ? L" (" + time_text(points[0]) + L")" : L"";
+			if (before.size() == 1) return object_title(before[0].second, before[0].first.layer, L"") + L" を分割" + at;
+			return std::to_wstring(before.size()) + L"個のオブジェクトを分割" + at;
+		}
+	}
+	if (!positions_only || list.size() < 2) return L"";
+	// 複数のオブジェクトをまとめて移動・長さ変更
+	std::vector<const ObjDelta*> sorted;
+	for (auto& d : list) sorted.push_back(&d);
+	std::sort(sorted.begin(), sorted.end(), [](const ObjDelta* x, const ObjDelta* y) {
+		return x->pos_before.layer != y->pos_before.layer ? x->pos_before.layer < y->pos_before.layer : x->pos_before.start < y->pos_before.start;
+	});
+	bool any_layer = false, any_start = false, any_end = false, all_same_length = true;
+	std::vector<int> layer_a, layer_b, start_a, start_b, end_a, end_b;
+	for (auto* d : sorted) {
+		const ObjPos& a = d->pos_before;
+		const ObjPos& b = d->pos_after;
+		any_layer |= a.layer != b.layer;
+		any_start |= a.start != b.start;
+		any_end |= a.end != b.end;
+		all_same_length &= (a.end - a.start) == (b.end - b.start);
+		layer_a.push_back(a.layer); layer_b.push_back(b.layer);
+		start_a.push_back(a.start); start_b.push_back(b.start);
+		end_a.push_back(a.end + 1); end_b.push_back(b.end + 1);
+	}
+	// 変更前→変更後の一覧。4個以上は長くなるので、ずれ幅が揃っていれば「+0.50秒」の形にする
+	auto frames_text = [&](const std::vector<int>& fa, const std::vector<int>& fb) -> std::wstring {
+		if (fa.size() <= 3) {
+			std::wstring ta, tb;
+			for (size_t i = 0; i < fa.size(); i++) { ta += (i ? L"," : L"") + time_text(fa[i]); tb += (i ? L"," : L"") + time_text(fb[i]); }
+			return ta + L"→" + tb;
+		}
+		int delta = fb[0] - fa[0];
+		for (size_t i = 0; i < fa.size(); i++) if (fb[i] - fa[i] != delta) return L"";
+		return (delta >= 0 ? L"+" : L"-") + time_text(delta >= 0 ? delta : -delta);
+	};
+	auto layers_text = [&]() -> std::wstring {
+		if (layer_a.size() > 3) {
+			int delta = layer_b[0] - layer_a[0];
+			for (size_t i = 0; i < layer_a.size(); i++) if (layer_b[i] - layer_a[i] != delta) return L"";
+			return L"レイヤー " + std::wstring(delta >= 0 ? L"+" : L"") + std::to_wstring(delta);
+		}
+		std::wstring ta, tb;
+		for (size_t i = 0; i < layer_a.size(); i++) {
+			ta += (i ? L"," : L"") + (L"L" + std::to_wstring(layer_a[i] + 1));
+			tb += (i ? L"," : L"") + (L"L" + std::to_wstring(layer_b[i] + 1));
+		}
+		return ta + L"→" + tb;
+	};
+	std::wstring count = std::to_wstring(sorted.size()) + L"個のオブジェクト";
+	std::vector<std::wstring> details;
+	std::wstring what;
+	if (all_same_length) {
+		what = L"を移動";
+		if (any_layer) details.push_back(layers_text());
+		if (any_start) { std::wstring t = frames_text(start_a, start_b); if (!t.empty()) details.push_back(L"開始 " + t); }
+	} else if (!any_layer) {
+		what = L"の長さを変更";
+		if (any_start && !any_end) { std::wstring t = frames_text(start_a, start_b); if (!t.empty()) details.push_back(L"開始 " + t); }
+		if (any_end && !any_start) { std::wstring t = frames_text(end_a, end_b); if (!t.empty()) details.push_back(L"終了 " + t); }
+	}
+	if (what.empty()) return L"";
+	std::wstring detail;
+	for (auto& t : details) if (!t.empty()) detail += (detail.empty() ? L"" : L" / ") + t;
+	return count + what + (detail.empty() ? L"" : L" (" + detail + L")");
+}
+
+// レイヤー設定の値の表示 (小数は末尾の0を省く)
+std::wstring number_text(double v) {
+	wchar_t buf[32];
+	swprintf_s(buf, L"%.2f", v);
+	std::wstring s = buf;
+	while (!s.empty() && s.back() == L'0') s.pop_back();
+	if (!s.empty() && s.back() == L'.') s.pop_back();
+	return s;
+}
+
+// レイヤーの名前・表示・ロック・レイヤー設定の変化を説明する
+std::wstring describe_layer(uintptr_t item, Entry& e, bool single) {
+	int index = layer_index(item_target(item));
+	std::wstring layer = index >= 0 ? L"レイヤー" + std::to_wstring(index + 1) : L"レイヤー";
+	struct LayerState { int x = 0, y = 0; float volume = 0, balance = 0; uint8_t hide = 0, lock = 0; std::wstring name; };
+	auto read_state = [&](int off) {
+		LayerState s;
+		s.x = read_or<int>(item + off, 0);
+		s.y = read_or<int>(item + off + 4, 0);
+		s.volume = read_or<float>(item + off + 8, 0);
+		s.balance = read_or<float>(item + off + 12, 0);
+		s.hide = read_or<uint8_t>(item + off + 0x10, 0);
+		s.lock = read_or<uint8_t>(item + off + 0x11, 0);
+		s.name = read_wstring(item + off + 0x18);
+		return s;
+	};
+	LayerState a = read_state(LAYER_BEFORE), b = read_state(LAYER_AFTER);
+	std::vector<std::wstring> texts;
+	if (a.name != b.name) texts.push_back(b.name.empty() ? L"名前を標準に戻す" : L"名前「" + shorten(b.name) + L"」");
+	if (a.hide != b.hide) texts.push_back(b.hide ? L"非表示" : L"表示");
+	if (a.lock != b.lock) texts.push_back(b.lock ? L"ロック" : L"ロック解除");
+	struct Setting { const wchar_t* name; std::wstring before, after; };
+	std::vector<Setting> settings;
+	if (a.x != b.x) settings.push_back({ L"X", std::to_wstring(a.x), std::to_wstring(b.x) });
+	if (a.y != b.y) settings.push_back({ L"Y", std::to_wstring(a.y), std::to_wstring(b.y) });
+	if (a.volume != b.volume) settings.push_back({ L"音量", number_text(a.volume), number_text(b.volume) });
+	if (a.balance != b.balance) settings.push_back({ L"左右", number_text(a.balance), number_text(b.balance) });
+	for (auto& s : settings) texts.push_back(std::wstring(s.name) + L" " + s.before + L"→" + s.after);
+	if (texts.empty()) return layer + L" を変更";
+	std::wstring text = layer + L" ";
+	for (size_t i = 0; i < texts.size(); i++) text += (i ? L", " : L"") + texts[i];
+	// 同じレイヤーの同じレイヤー設定の変更が続く時は表示上まとめる
+	if (single && texts.size() == 1 && settings.size() == 1 && index >= 0) {
+		e.merge_object = (uintptr_t)index + 1;
+		e.merge_key = "\x1b" + wide_to_utf8(settings[0].name);
+		e.merge_prefix = layer + L" " + settings[0].name + L" ";
+		e.values = { { L"", wide_to_utf8(settings[0].before), wide_to_utf8(settings[0].after) } };
+	}
+	return text;
+}
+
+// 段の説明を作る (段の項目がまだ本体にある間に呼ぶ)。latest: 本体が今この段を適用した最新の状態か
+void describe_step(Entry& e, bool latest) {
+	g_describe_latest = latest;
+	EDIT_INFO info = {};
+	edit_handle->get_edit_info(&info, sizeof(info));
+	if (info.rate > 0) { g_rate = info.rate; g_scale = info.scale; }
+	e.merge_object = 0;
+	e.merge_key.clear();
+	e.merge_prefix.clear();
+	e.values.clear();
+
+	std::vector<ObjDelta> objects;
+	auto delta_of = [&](uintptr_t obj) -> ObjDelta& {
+		for (auto& d : objects) if (d.obj == obj) return d;
+		objects.push_back(ObjDelta());
+		objects.back().obj = obj;
+		return objects.back();
+	};
+	std::vector<uintptr_t> layers;
+	std::vector<std::tuple<uintptr_t, uintptr_t, uintptr_t>> groups;	// グループの変化 (オブジェクト, 変更前, 変更後)
+	std::vector<std::wstring> others;
+	for (uintptr_t item : e.items) {
+		UndoKind kind = kind_of(item);
+		uintptr_t target = item_target(item);
+		switch (kind) {
+		case UK_OBJECT_UPDATE: {
+			ObjDelta& d = delta_of(target);
+			d.has_pos = true;
+			d.pos_before = { read_or<int>(item + UPDATE_BEFORE, 0), read_or<int>(item + UPDATE_BEFORE + 4, 0), read_or<int>(item + UPDATE_BEFORE + 8, 0) };
+			d.pos_after = { read_or<int>(item + UPDATE_AFTER, 0), read_or<int>(item + UPDATE_AFTER + 4, 0), read_or<int>(item + UPDATE_AFTER + 8, 0) };
+			d.name_before = read_wstring(item + UPDATE_BEFORE + UPDATE_NAME);
+			d.name_after = read_wstring(item + UPDATE_AFTER + UPDATE_NAME);
+			// 中間点の移動はこの項目の中間点の並びだけが変わる
+			uintptr_t sa = read_or<uintptr_t>(item + UPDATE_BEFORE + UPDATE_SECTIONS, 0), sb = read_or<uintptr_t>(item + UPDATE_AFTER + UPDATE_SECTIONS, 0);
+			auto va = sa ? read_vector<int>(sa) : std::vector<int>(), vb = sb ? read_vector<int>(sb) : std::vector<int>();
+			if (va != vb) {
+				d.has_sections = true;
+				d.sections_before = va;
+				d.sections_after = vb;
+			}
+			break;
+		}
+		case UK_OBJECT_CREATE_DELETE: {
+			int layers_ba[2] = { 0, 0 };	// 変更前・変更後のレイヤー (-1はオブジェクトが無い)
+			safe_copy(layers_ba, item + CREATE_DELETE_STATE, sizeof(layers_ba));
+			ObjDelta& d = delta_of(target);
+			if (layers_ba[0] < 0) { d.created = true; d.created_layer = layers_ba[1]; }
+			else if (layers_ba[1] < 0) { d.deleted = true; d.deleted_layer = layers_ba[0]; }
+			break;
+		}
+		case UK_OBJECT_FLAG: {
+			ObjDelta& d = delta_of(target);
+			d.has_flags = true;
+			d.flags_before = read_or<uint32_t>(item + FLAG_STATE, 0);
+			d.flags_after = read_or<uint32_t>(item + FLAG_STATE + 4, 0);
+			break;
+		}
+		case UK_OBJECT_EFFECT: {
+			ObjDelta& d = delta_of(target);
+			d.has_effects = true;
+			d.effects_before = effect_list(item + EFFECTS_BEFORE);
+			d.effects_after = effect_list(item + EFFECTS_AFTER);
+			break;
+		}
+		case UK_OBJECT_SECTION: {
+			ObjDelta& d = delta_of(target);
+			d.has_sections = true;
+			d.sections_before = read_vector<int>(item + SECTIONS_BEFORE);
+			d.sections_after = read_vector<int>(item + SECTIONS_AFTER);
+			break;
+		}
+		case UK_OBJECT_GROUP:
+			groups.push_back({ target, read_or<uintptr_t>(item + GROUP_BEFORE, 0), read_or<uintptr_t>(item + GROUP_AFTER, 0) });
+			break;
+		case UK_EFFECT_UPDATE: {
+			uintptr_t owner = read_or<uintptr_t>(target + EFFECT_OWNER, 0);
+			if (owner) delta_of(owner).effect_items.push_back(item);
+			break;
+		}
+		case UK_LAYER_UPDATE: layers.push_back(item); break;
+		case UK_LAYER_MOVE: others.push_back(L"レイヤーを移動"); break;
+		case UK_LAYER_CREATE_DELETE: others.push_back(L"レイヤーを挿入・削除"); break;
+		case UK_COLOR_SETTING: others.push_back(L"色の設定を変更"); break;
+		default: others.push_back(L"(種類の分からない編集)"); break;
+		}
+	}
+	// 作って削除した等、変化の無いもの(中間点を追加すると各エフェクトの値の並びも変わる等)は数えない
+	std::vector<ObjDelta> changed;
+	for (auto& d : objects) {
+		if (d.created && d.deleted) continue;
+		changed.push_back(d);
+	}
+	// 中間点の変更に伴う設定項目の値の並びの変化は、中間点の変更として説明する
+	for (auto& d : changed) if (d.has_sections) d.effect_items.clear();
+	// グループ化。同じ段で追加したオブジェクトがグループに入るのは追加の一部 (グループ化したオブジェクトの分割・貼り付け等)
+	int grouped = 0, ungrouped = 0, regrouped = 0;
+	for (auto& [obj, a, b] : groups) {
+		bool created = false;
+		for (auto& d : changed) if (d.obj == obj && d.created) created = true;
+		if (created) continue;
+		if (!a && b) grouped++;
+		else if (a && !b) ungrouped++;
+		else if (a != b) regrouped++;
+	}
+
+	std::vector<std::wstring> texts;
+	bool single = changed.size() == 1 && layers.empty() && others.empty() && !grouped && !ungrouped && !regrouped;
+	std::wstring multi = layers.empty() && others.empty() && !grouped && !ungrouped ? describe_multi_objects(changed) : L"";
+	if (!multi.empty()) {
+		texts.push_back(multi);
+	} else {
+		for (auto& d : changed) {
+			texts.push_back(describe_object(d, e, single));
+		}
+	}
+	if (grouped) texts.push_back(std::to_wstring(grouped) + L"個のオブジェクトをグループ化");
+	if (ungrouped) texts.push_back(std::to_wstring(ungrouped) + L"個のオブジェクトのグループを解除");
+	if (regrouped) texts.push_back(std::to_wstring(regrouped) + L"個のオブジェクトのグループを変更");
+	for (uintptr_t item : layers) texts.push_back(describe_layer(item, e, layers.size() == 1 && changed.empty() && others.empty()));
+	for (auto& t : others) if (std::find(texts.begin(), texts.end(), t) == texts.end()) texts.push_back(t);
+	if (texts.empty()) {
+		e.label = L"(内容の無い編集)";
+		return;
+	}
+	e.label = texts[0] + (texts.size() > 1 ? L" 他" + std::to_wstring(texts.size() - 1) + L"件" : L"");
+}
+
+// 一覧でまとめた行(entries[first..last])の説明を、最初の変更前→最後の変更後で作り直す
+std::wstring merged_label(const std::vector<Entry>& entries, int first, int last) {
+	const Entry& f = entries[first];
+	const Entry& l = entries[last];
+	const std::string& key = l.merge_key;
+	if (key.empty() || f.values.empty() || l.values.empty()) return l.label;
+	// 頭(「[L1]図形 」等)は最初の行のもの (途中でレイヤーを移動しても、最初のレイヤーで出す)
+	if (key[0] == '\x1c') {
+		ObjPos a = ObjPos::parse(f.values[0].before), b = ObjPos::parse(l.values[0].after);
+		std::wstring desc = describe_position_change(a, b);
+		bool layer_moved = false;
+		for (int i = first; i <= last; i++) {
+			if (!entries[i].values.empty() && ObjPos::parse(entries[i].values[0].before).layer != ObjPos::parse(entries[i].values[0].after).layer) layer_moved = true;
+		}
+		// 別のレイヤーへ移動して元のレイヤーに戻った: 「を L1 へ移動」とする (最初と最後だけ比べると変化が無く見える)
+		if (layer_moved && a.layer == b.layer) {
+			desc = L"を L" + std::to_wstring(b.layer + 1) + L" へ移動";
+			if (a.start != b.start) desc += L" (開始 " + time_text(a.start) + L"→" + time_text(b.start) + L")";
+		}
+		if (desc.empty()) desc = L"を移動 (開始 " + time_text(a.start) + L"→" + time_text(b.start) + L")";
+		return f.merge_prefix + desc;
+	}
+	if (key[0] == '\x1b') {
+		return f.merge_prefix + utf8_to_wide(f.values[0].before) + L"→" + utf8_to_wide(l.values[0].after);
+	}
+	if (key[0] == '\x1d') {
+		// 項目ごとに、その項目が最初に変わった時の変更前と、最後に変わった時の変更後を比べる
+		std::vector<std::wstring> items;
+		std::map<std::wstring, ValueChange> range;
+		for (int i = first; i <= last; i++) {
+			for (auto& v : entries[i].values) {
+				auto it = range.find(v.item);
+				if (it == range.end()) {
+					range[v.item] = v;
+					items.push_back(v.item);
+				} else {
+					it->second.after = v.after;
+				}
+			}
+		}
+		std::wstring text = f.merge_prefix;
+		for (size_t i = 0; i < items.size(); i++) {
+			const ValueChange& v = range[items[i]];
+			std::wstring name = items[i].substr(items[i].find(L'\x1f') + 1);
+			text += i ? L", " : L"";
+			if (v.kind == VALUE_COLOR_LIST) text += describe_color_list(v.names, decode_color_list(v.before), decode_color_list(v.after));
+			else if (v.kind == VALUE_OTHER && v.before.empty()) text += name + L" を " + shorten(utf8_to_wide(v.after)) + L" に変更";
+			else text += name + describe_value_change(v.before, v.after);
+		}
+		return text;
+	}
+	return l.label;
+}
 
 //=======================================================================
 //	Keychain to Transformとの連携
-//	Keychain to Transformの「操作中の変更をUndo 1件にまとめる」方式では、操作中に本体のUndo(メインメニューのWM_COMMAND)と
-//	書き込みを繰り返す。途中の状態を読むとUndoと書き込みを区別できず記録が壊れるため、操作中はメインウィンドウに付く印
-//	(プロパティ)を見て、通知とUndo/Redoのコマンドの観測をまとめ、終了のメッセージ(wParamに操作の結果)を受けてから1回だけ処理する。
-//	  結果 0 = 何も書き込まなかった / 1 = 確定した(本体のUndoに1件) /
-//	       2 = 書き込んだ後にキャンセルした(状態は開始時のままだが、本体のやり直せる分はキャンセルした変形の1件に置き換わった) /
-//	       3 = 途中でまとめる方式をやめた
+//	Keychain to Transformの「操作中の変更をUndo 1件にまとめる」方式では、操作中に本体のUndoと書き込みを繰り返す。
+//	途中の状態を読むと余計な段が見えるので、操作中(メインウィンドウに印のプロパティが付いている間)は読まず、
+//	終わった後の確認(通知・定期的な確認)で本体の履歴に合わせる
 //=======================================================================
 const wchar_t* KEYCHAIN_ACTIVE_PROP_NAME = L"KeychainToTransform.SingleUndoActive";
-const wchar_t* KEYCHAIN_FINISHED_MESSAGE_NAME = L"KeychainToTransform.SingleUndoFinished";
-const UINT g_keychain_finished_message = RegisterWindowMessageW(KEYCHAIN_FINISHED_MESSAGE_NAME);
-enum { KEYCHAIN_RESULT_NO_WRITE = 0, KEYCHAIN_RESULT_COMMITTED = 1, KEYCHAIN_RESULT_CANCELED = 2, KEYCHAIN_RESULT_FALLBACK = 3 };
 
-// Keychain to TransformがUndoを1件にまとめる方式で操作中か
 bool is_keychain_active() {
 	HWND main = edit_handle ? edit_handle->get_host_app_window() : nullptr;
 	return main && GetPropW(main, KEYCHAIN_ACTIVE_PROP_NAME) != nullptr;
 }
 
-void observe_command(Command cmd) {
-	// Keychain to Transformが操作中に送るUndoは、操作全体を1件の編集として扱うので観測しない
-	if (is_keychain_active()) return;
-	g_observed.push_back({ cmd, GetTickCount64() });
-	// グループ化のUndo/Redoは通知が来ないので、来なかった時にプロジェクトファイルを読んで確かめる
-	if (g_track_layer_settings) SetTimer(g_hwnd, TIMER_ID_UNNOTIFIED, UNNOTIFIED_WAIT_MS, nullptr);
-}
-
-// グループ化・グループ解除のコマンドを観測した (本体が処理し終えてから確かめる)
-void observe_group_command() {
-	if (g_track_layer_settings) PostMessageW(g_hwnd, WM_APP_GROUP_COMMAND, 0, 0);
-}
-
-bool is_jump_active();
-
-// 通知が来た時に、直前に観測したコマンドを1つ取り出す (古いものは捨てる)
-// クリックで戻している途中は、自分で送ったコマンドなので時間では捨てない
-// (重い編集では本体の処理に時間がかかり、通知がCOMMAND_EXPIRE_MSより遅れて「移動中に編集された」と誤判定されたため)
-Command take_observed_command() {
-	ULONGLONG now = GetTickCount64();
-	while (!is_jump_active() && !g_observed.empty() && now - g_observed.front().second > COMMAND_EXPIRE_MS) g_observed.pop_front();
-	if (g_observed.empty()) return CMD_NONE;
-	Command cmd = g_observed.front().first;
-	g_observed.pop_front();
-	return cmd;
-}
-
-// 数値欄へのキーボード入力のまとまり。Enter・Tab・Esc・マウスの押下で区切る (本体ではEscもEnterと同じく入力中の値で確定する)
-int g_input_session = 0;		// 入力中のまとまりの番号
-bool g_input_open = false;
-int g_closed_session = -1;		// 直前に区切ったまとまりの番号 (区切った直後の確定の通知をまとめるため)
-ULONGLONG g_input_close_tick = 0;
-ULONGLONG g_last_input_key_tick = 0;
-
-// 数値欄への入力がまだ確定していない項目か (入力のまとまりが開いているか、区切った直後)
-// 確定するまで本体のUndo履歴には積まれていないので、本体のメニューの状態と写しが一時的に食い違う
-bool is_input_pending(const Entry& e) {
-	if (!e.input_object) return false;
-	if (g_input_open && e.input_session == g_input_session) return true;
-	return e.input_session == g_closed_session && GetTickCount64() - g_input_close_tick < INPUT_CLOSE_GRACE_MS;
-}
-
-void close_input_session() {
-	if (!g_input_open) return;
-	g_closed_session = g_input_session;
-	g_input_close_tick = GetTickCount64();
-	g_input_session++;
-	g_input_open = false;
-}
-
-bool is_input_key(WPARAM vk) {
-	return (vk >= '0' && vk <= '9') || (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9) || vk == VK_OEM_PERIOD || vk == VK_DECIMAL ||
-		vk == VK_OEM_MINUS || vk == VK_SUBTRACT || vk == VK_BACK || vk == VK_DELETE;
-}
-
-bool match_shortcut(const Shortcut& sc, WPARAM vk, bool ctrl, bool shift, bool alt) {
-	return sc.valid && vk == sc.vk && ctrl == sc.ctrl && shift == sc.shift && alt == sc.alt;
-}
-
-LRESULT CALLBACK keyboard_hook_proc(int code, WPARAM wparam, LPARAM lparam) {
-	// キーを押した時(キーリピートを含む)だけを見る。bit31が1なら離した時
-	if (code == HC_ACTION && !(lparam & 0x80000000)) {
-		bool ctrl = GetKeyState(VK_CONTROL) < 0, shift = GetKeyState(VK_SHIFT) < 0, alt = GetKeyState(VK_MENU) < 0;
-		if (match_shortcut(g_undo_key, wparam, ctrl, shift, alt)) observe_command(CMD_UNDO);
-		else if (match_shortcut(g_redo_key, wparam, ctrl, shift, alt)) observe_command(CMD_REDO);
-		else if (match_shortcut(g_group_key, wparam, ctrl, shift, alt) || match_shortcut(g_ungroup_key, wparam, ctrl, shift, alt)) observe_group_command();
-		else if (!ctrl && !alt && is_input_key(wparam)) {
-			g_input_open = true;
-			g_last_input_key_tick = GetTickCount64();
-		} else if (wparam == VK_RETURN || wparam == VK_TAB || wparam == VK_ESCAPE) {
-			close_input_session();
-		}
-	}
-	return CallNextHookEx(g_keyboard_hook, code, wparam, lparam);
-}
-
-// タイムラインの右クリックのメニュー等からのグループ化・グループ解除を観測する。
-// これらのメニューもメインウィンドウが持ち主だが、選んだ項目のWM_COMMANDは送られない(メニューが閉じた後に本体が実行する)ので、
-// メニューの中で最後に選ばれていた項目の名前をWM_MENUSELECTで覚えておき、メニューが閉じた時にそれがグループ化・グループ解除なら確かめる
-// (選ばずに閉じた場合も確かめることになるが、変化が無ければ何も足さない)。
-// メインメニューの「オブジェクトのグループ化」「オブジェクトのグループ解除」はWM_COMMANDで観測しているので除く。無効な項目も除く
-std::wstring g_menu_selected;
-
-LRESULT CALLBACK callwnd_hook_proc(int code, WPARAM wparam, LPARAM lparam) {
-	if (code == HC_ACTION && g_track_layer_settings) {
-		auto* cwp = (CWPSTRUCT*)lparam;
-		if (cwp->message == WM_MENUSELECT) {
-			UINT item = LOWORD(cwp->wParam), flags = HIWORD(cwp->wParam);
-			HMENU menu = (HMENU)cwp->lParam;
-			if (flags == 0xFFFF && !menu) {
-				// メニューが閉じた
-				if (is_menu_name_any(g_menu_selected, GROUP_NAMES) || is_menu_name_any(g_menu_selected, UNGROUP_NAMES)) {
-					observe_group_command();
-				}
-				g_menu_selected.clear();
-			} else if (menu) {
-				wchar_t text[256] = {};
-				bool skip = (flags & (MF_POPUP | MF_GRAYED | MF_DISABLED)) || item == g_group_id || item == g_ungroup_id;
-				if (!skip) GetMenuStringW(menu, item, text, 256, MF_BYCOMMAND);
-				g_menu_selected = text;
-			}
-		}
-	}
-	return CallNextHookEx(g_callwnd_hook, code, wparam, lparam);
-}
-
-LRESULT CALLBACK main_subclass_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam, UINT_PTR, DWORD_PTR) {
-	if (message == g_keychain_finished_message) {
-		PostMessageW(g_hwnd, WM_APP_EXTERNAL_FINISHED, wparam, 0);
-	} else if (message == WM_COMMAND && lparam == 0) {
-		UINT id = LOWORD(wparam);
-		if (id && id == g_undo_id) observe_command(CMD_UNDO);
-		else if (id && id == g_redo_id) observe_command(CMD_REDO);
-		else if (id && (id == g_group_id || id == g_ungroup_id)) observe_group_command();
-	} else if (message == WM_INITMENUPOPUP && !g_sending_initmenu) {
-		// ユーザーがメニューを開いた時にショートカットの割り当てを読み直す (割り当ての変更に追従する)
-		LRESULT result = DefSubclassProc(hwnd, message, wparam, lparam);
-		read_shortcuts();
-		return result;
-	}
-	return DefSubclassProc(hwnd, message, wparam, lparam);
-}
-
 //=======================================================================
-//	マウスの押下・解放 (ドラッグ1回を1件に区切る)
-//=======================================================================
-
-bool g_button_down = false;
-bool g_pending_update = false;	// 押下中に来た通知を、解放で処理する
-
-void process_update();
-
-// 押されているボタン (左・右・中)。カメラ制御ではプレビューの右ボタンドラッグで視点を変えられ、本体はそれも1ドラッグ1件のUndoにする
-enum { BUTTON_LEFT = 1, BUTTON_RIGHT = 2, BUTTON_MIDDLE = 4 };
-int g_buttons = 0;
-
-void on_button_down(int button) {
-	// 前の押下の分がまだなら、新しい押下の変更が入る前に処理する
-	if (g_buttons == 0 && g_pending_update) {
-		g_pending_update = false;
-		process_update();
-	}
-	g_buttons |= button;
-	g_button_down = true;
-}
-
-void on_button_up(int button) {
-	if (!(g_buttons & button)) return;
-	g_buttons &= ~button;
-	if (g_buttons == 0) {
-		g_button_down = false;
-		// 本体が解放を処理し終えてから処理する (投げたメッセージは次の入力より先に処理される)
-		if (g_pending_update) PostMessageW(g_hwnd, WM_APP_RELEASED, 0, 0);
-	}
-}
-
-LRESULT CALLBACK mouse_hook_proc(int code, WPARAM wparam, LPARAM lparam) {
-	if (code == HC_ACTION) {
-		switch (wparam) {
-		case WM_LBUTTONDOWN: case WM_LBUTTONDBLCLK: case WM_NCLBUTTONDOWN: case WM_NCLBUTTONDBLCLK:
-			close_input_session();	// クリックで数値欄への入力は確定する
-			on_button_down(BUTTON_LEFT);
-			break;
-		case WM_RBUTTONDOWN: case WM_RBUTTONDBLCLK: case WM_NCRBUTTONDOWN: case WM_NCRBUTTONDBLCLK:
-			on_button_down(BUTTON_RIGHT);
-			break;
-		case WM_MBUTTONDOWN: case WM_MBUTTONDBLCLK: case WM_NCMBUTTONDOWN: case WM_NCMBUTTONDBLCLK:
-			on_button_down(BUTTON_MIDDLE);
-			break;
-		case WM_LBUTTONUP: case WM_NCLBUTTONUP:
-			on_button_up(BUTTON_LEFT);
-			break;
-		case WM_RBUTTONUP: case WM_NCRBUTTONUP:
-			on_button_up(BUTTON_RIGHT);
-			break;
-		case WM_MBUTTONUP: case WM_NCMBUTTONUP:
-			on_button_up(BUTTON_MIDDLE);
-			break;
-		}
-	}
-	return CallNextHookEx(g_mouse_hook, code, wparam, lparam);
-}
-
-//=======================================================================
-//	判定 (通知ごとに写しを更新する)
+//	写しを本体の履歴に合わせる
 //=======================================================================
 
 // クリックで戻している途中の状態
@@ -1760,33 +1638,14 @@ struct Jump {
 	int last_pos = 0;
 	ULONGLONG sent_tick = 0;	// 最後にコマンドを送った時刻
 	bool keeping = false;		// WM_APP_JUMP_KEEPを投げ続けているか
-	bool unnotified_checked = false;	// 送ったコマンドに通知が来ないのを確かめたか
+	UINT undo_id = 0, redo_id = 0;	// 「元に戻す」「やり直し」のメニューのID (始める時に1回探す)
 } g_jump;
 
-bool is_jump_active() { return g_jump.active; }
-
-void reset_history(SceneHistory& sh, const std::wstring& reason) {
-	sh.entries.clear();
-	Entry start;
-	start.hash = state_hash(sh.state);
-	start.label = L"開始時点";
-	sh.entries.push_back(start);
-	sh.pos = 0;
-	if (!reason.empty()) log_line(L"[EditHistory] 履歴を取り直しました (" + reason + L")");
-}
-
-// 現在のシーンの写しを用意する (無ければ全オブジェクトを読んで開始時点を作る)
-void ensure_scene() {
-	EDIT_INFO info = {};
-	edit_handle->get_edit_info(&info, sizeof(info));
-	if (info.scene_id != g_scene_id) g_scene_id = info.scene_id;
-	SceneHistory& sh = current_history();
-	if (!sh.initialized) {
-		sh.state = State();
-		refresh_state(sh, {}, true);
-		reset_history(sh, L"");
-		sh.initialized = true;
-	}
+void abort_jump(const std::wstring& reason) {
+	if (!g_jump.active) return;
+	g_jump.active = false;
+	KillTimer(g_hwnd, TIMER_ID_JUMP_TIMEOUT);
+	log_line(L"[EditHistory] 移動を中止しました (" + reason + L")");
 }
 
 // entries[from..to)を消す時、クリックで戻す目標の番号を補正する。目標が消える場合はlandedを目標にする
@@ -1796,94 +1655,144 @@ void adjust_jump_target(int from, int to, int landed) {
 	else if (g_jump.target >= to) g_jump.target -= to - from;
 }
 
-// entries[from..to)の範囲の対象オブジェクトを集める
-void collect_candidates(const SceneHistory& sh, int from, int to, std::set<OBJECT_HANDLE>& out) {
-	from = std::max(from, 0);
-	to = std::min(to, (int)sh.entries.size());
-	for (int i = from; i < to; i++) for (auto h : sh.entries[i].objects) out.insert(h);
-}
-
-// 現在位置からdir方向(-1:前 / +1:後ろ)に、ハッシュが一致する最も近い項目を探す (無ければ-1)
-int find_nearest(const SceneHistory& sh, uint64_t hash, int dir) {
-	for (int i = sh.pos + dir; i >= 0 && i < (int)sh.entries.size(); i += dir) {
-		if (sh.entries[i].hash == hash) return i;
-	}
-	return -1;
-}
-
-// まとめた項目のラベルを付け直す。「…項目 A→B」の形で同じ項目の変更どうしなら、最初の変更前の値→最後の変更後の値にする
-void merge_label(const Entry& first, Entry& last) {
-	if (first.has_change && last.has_change) last.change_before = first.change_before;
-	size_t fa = first.label.rfind(L'→'), la = last.label.rfind(L'→');
-	if (fa == std::wstring::npos || la == std::wstring::npos) return;
-	size_t fs = first.label.rfind(L' ', fa), ls = last.label.rfind(L' ', la);
-	if (fs == std::wstring::npos || ls == std::wstring::npos) return;
-	if (first.label.compare(0, fs, last.label, 0, ls) != 0) return;
-	last.label = last.label.substr(0, ls + 1) + first.label.substr(fs + 1, fa - fs - 1) + last.label.substr(la);
-	if (!first.input_before.empty()) last.input_before = first.input_before;
-}
-
-// Undoでpos→targetへ移った時、間の項目(本体のUndo履歴に無い途中の状態)をまとめる
-// entries[target+1..pos]が本体では1件だったので、entries[pos]を残して間を消す
-void merge_skipped_undo(SceneHistory& sh, int target) {
-	if (sh.pos - target > 1) {
-		Entry& last = sh.entries[sh.pos];
-		merge_label(sh.entries[target + 1], last);
-		for (int i = target + 1; i < sh.pos; i++) {
-			for (auto h : sh.entries[i].objects) last.objects.push_back(h);
-		}
-		adjust_jump_target(target + 1, sh.pos, target);
-		sh.entries.erase(sh.entries.begin() + target + 1, sh.entries.begin() + sh.pos);
-	}
-	sh.pos = target;
-}
-
-// Redoでpos→targetへ移った時、間の項目をまとめる (entries[target]を残して間を消す)
-void merge_skipped_redo(SceneHistory& sh, int target) {
-	if (target - sh.pos > 1) {
-		Entry& last = sh.entries[target];
-		merge_label(sh.entries[sh.pos + 1], last);
-		for (int i = sh.pos + 1; i < target; i++) {
-			for (auto h : sh.entries[i].objects) last.objects.push_back(h);
-		}
-		adjust_jump_target(sh.pos + 1, target, sh.pos + 1);
-		sh.entries.erase(sh.entries.begin() + sh.pos + 1, sh.entries.begin() + target);
-	}
-	sh.pos = sh.pos + 1;
-}
-
-// 行き先を探す。見つからなければ全オブジェクトを読み直してもう一度探す
-int find_destination(SceneHistory& sh, int dir, uint64_t& hash) {
-	int found = find_nearest(sh, hash, dir);
-	if (found >= 0) return found;
-	refresh_state(sh, {}, true);
-	hash = state_hash(sh.state);
-	return find_nearest(sh, hash, dir);
-}
-
-void add_edit(SceneHistory& sh, const Refresh& r, uint64_t hash) {
-	sh.entries.resize(sh.pos + 1);	// やり直せる分を捨てる
+// 新しい段: 説明を作る (段が本体から捨てられた後は項目のメモリを読めないので、見えた時に作っておく)
+Entry make_entry(const std::vector<uintptr_t>& items, bool latest) {
 	Entry e;
-	e.hash = hash;
-	make_entry_info(r, e);
-	sh.entries.push_back(e);
-	sh.pos = (int)sh.entries.size() - 1;
-	// 本体のUndoの上限を超えた分は先頭(開始時点の次)から捨てる
-	while ((int)sh.entries.size() > HISTORY_MAX + 1) {
-		sh.entries.erase(sh.entries.begin());
-		sh.entries[0].label = L"開始時点";
-		sh.pos--;
+	e.items = items;
+	describe_step(e, latest);
+	return e;
+}
+
+struct SyncResult {
+	bool ok = false;		// 本体の履歴を読めた
+	bool changed = false;	// 本体の履歴か現在位置が変わった
+	bool new_edit = false;	// 新しい段が積まれた
+};
+
+// 本体の履歴を読み、写しを合わせる
+SyncResult sync_history(SceneHistory& sh) {
+	SyncResult res;
+	// 変わっていなければ何もしない (目印だけを読んで比べる。ほとんどの確認はここで終わる)
+	UndoKey key;
+	if (!read_undo_key(key)) return res;
+	int m0 = (int)sh.entries.size() - 1;
+	if (sh.hist == key.hist && (uint64_t)m0 == key.size && (uint64_t)(m0 - sh.pos) == key.pos &&
+		(m0 == 0 || (!sh.entries.back().items.empty() && sh.entries.back().items[0] == key.newest))) {
+		res.ok = true;
+		return res;
 	}
+	UndoSnapshot s;
+	if (!read_undo_snapshot(s)) return res;
+	res.ok = true;
+	res.changed = true;
+	int n = (int)s.steps.size();
+	int new_pos = n - (int)s.pos;
+
+	int matched = 0;
+	if (sh.hist != s.hist) {
+		// 初めて読む(またはプロジェクトが変わった): 本体にある段を全て写す
+		sh.entries.assign(1, Entry());
+		sh.hist = s.hist;
+		abort_jump(L"履歴が切り替わった");
+		if (n) log_line(L"[EditHistory] 監視を始める前の編集が" + std::to_wstring(n) + L"件あります");
+	} else {
+		// 写しの段と本体の段を照らし合わせる。本体の最古の段が写しのどこにあるかを探し、そこから一致する所までを残す
+		int m = (int)sh.entries.size() - 1;
+		int d = -1;
+		if (n > 0) {
+			for (int i = 0; i < m; i++) {
+				if (sh.entries[1 + i].items == s.steps[0]) { d = i; break; }
+			}
+		}
+		if (d > 0) {
+			// 上限を超えて捨てられた古い段: 写しの先頭を詰める (entries[d]が新しい開始時点になる)
+			adjust_jump_target(0, d, 0);
+			sh.entries.erase(sh.entries.begin(), sh.entries.begin() + d);
+			m -= d;
+		}
+		if (d >= 0) {
+			while (matched < m && matched < n && sh.entries[1 + matched].items == s.steps[matched]) matched++;
+		} else if (m > 0) {
+			log_line(L"[EditHistory] 本体の履歴と照らし合わせられないので、写しを作り直しました");
+		}
+		// 本体から無くなった新しい側の段 (やり直せる段を捨てた新しい編集)
+		if (1 + matched < (int)sh.entries.size()) {
+			adjust_jump_target(1 + matched, (int)sh.entries.size(), matched);
+			sh.entries.resize(1 + matched);
+		}
+	}
+	sh.entries[0] = Entry();
+	sh.entries[0].label = L"開始時点";
+	for (int k = matched; k < n; k++) sh.entries.push_back(make_entry(s.steps[k], k == n - 1 && s.pos == 0));
+	res.new_edit = matched < n;
+	sh.pos = new_pos;
+	return res;
 }
 
-void abort_jump(const std::wstring& reason) {
-	if (!g_jump.active) return;
-	g_jump.active = false;
-	KillTimer(g_hwnd, TIMER_ID_JUMP_TIMEOUT);
-	log_line(L"[EditHistory] 移動を中止しました (" + reason + L")");
-}
-
+// 通知・定期的な確認で、本体の履歴の変化を写しに反映する
 void send_next_jump_command();
+bool is_escape_pressed();
+bool g_read_error_logged = false;
+
+void process_update() {
+	if (!g_initialized || !g_undo.ok) return;
+	// Keychain to Transformの操作中は途中の状態を読まない (終わった後の確認で合わせる)
+	if (is_keychain_active()) return;
+	EDIT_INFO info = {};
+	edit_handle->get_edit_info(&info, sizeof(info));
+	bool scene_changed = info.scene_id != g_scene_id;
+	g_scene_id = info.scene_id;
+	if (scene_changed) abort_jump(L"シーンが切り替わった");
+	SceneHistory& sh = current_history();
+	if (!sh.initialized) {
+		sh.entries.assign(1, Entry());
+		sh.entries[0].label = L"開始時点";
+		sh.initialized = true;
+	}
+	SyncResult res = sync_history(sh);
+	if (!res.ok) {
+		if (!g_read_error_logged) log_line(L"[EditHistory] 本体のUndo履歴を読めませんでした");
+		g_read_error_logged = true;
+		return;
+	}
+	if (!res.changed && !scene_changed) return;
+#ifdef EH_DEBUG_LOG
+	{
+		std::wstring dump = L"[EditHistory] 写し pos=" + std::to_wstring(sh.pos) + L"/" + std::to_wstring(sh.entries.size() - 1);
+		for (size_t i = sh.entries.size() > 6 ? sh.entries.size() - 6 : 0; i < sh.entries.size(); i++) dump += L"\n  " + std::wstring((int)i == sh.pos ? L"*" : L" ") + std::to_wstring(i) + L" " + sh.entries[i].label;
+		log_line(dump);
+	}
+#endif
+
+	// クリックで戻している途中なら、進み具合を確かめる
+	bool send_next = false;
+	if (g_jump.active) {
+		if (res.new_edit) {
+			abort_jump(L"移動中に編集された");
+		} else if (g_jump.target >= (int)sh.entries.size()) {
+			abort_jump(L"目標の項目が無くなった");
+		} else if (sh.pos == g_jump.target) {
+			g_jump.active = false;
+			KillTimer(g_hwnd, TIMER_ID_JUMP_TIMEOUT);
+		} else if (sh.pos == g_jump.last_pos) {
+			// まだ本体が処理していない
+		} else if ((g_jump.target < g_jump.last_pos) != (sh.pos < g_jump.last_pos)) {
+			abort_jump(L"想定と違う向きに移動した");
+		} else {
+			send_next = true;
+		}
+	}
+	// Escで中止 (戻している間は入力が処理されないので、キーの状態を直接見る)
+	if (send_next && is_escape_pressed()) {
+		send_next = false;
+		abort_jump(L"Escで中止した");
+	}
+	// 次のコマンドはすぐに送る。投げたメッセージは入力・再描画より先に処理されるので、戻し終わるまで
+	// ユーザーの入力は処理されず、戻し終わった後に順に処理される。
+	// 本体の画面・一覧も更新されないので、戻している途中の帯はsend_next_jump_command()で直接描く
+	if (send_next) send_next_jump_command();
+	update_list();
+}
 
 // Escが押されたか (AviUtl2が前面の時だけ)。押し続けていなくても、前回調べてから押されていれば真
 bool is_escape_pressed() {
@@ -1892,191 +1801,6 @@ bool is_escape_pressed() {
 	DWORD process = 0;
 	GetWindowThreadProcessId(GetForegroundWindow(), &process);
 	return process == GetCurrentProcessId();
-}
-
-// 通知を受けて写しを更新する
-void process_update() {
-	if (!g_initialized) return;
-	int old_scene = g_scene_id;
-	ensure_scene();
-	SceneHistory& sh = current_history();
-	if (old_scene != g_scene_id) {
-		abort_jump(L"シーンが切り替わった");
-		// シーンが切り替わった: そのシーンの写しの現在位置と一致するか確かめる
-		refresh_state(sh, {}, false);
-		if (state_hash(sh.state) != sh.entries[sh.pos].hash) {
-			refresh_state(sh, {}, true);
-			if (state_hash(sh.state) != sh.entries[sh.pos].hash) reset_history(sh, L"シーンに戻った時に状態が一致しない");
-		}
-		update_list();
-		return;
-	}
-
-	// 入力が確定したら、預けていたやり直せる分は要らない (本体でも確定時にやり直せる分が消える)
-	if (!sh.entries[sh.pos].stashed_future.empty() && !is_input_pending(sh.entries[sh.pos])) {
-		sh.entries[sh.pos].stashed_future.clear();
-	}
-
-	Command cmd = take_observed_command();
-	std::set<OBJECT_HANDLE> candidates;
-	if (cmd == CMD_UNDO) collect_candidates(sh, 0, sh.pos + 1, candidates);
-	if (cmd == CMD_REDO) collect_candidates(sh, sh.pos + 1, (int)sh.entries.size(), candidates);
-	Refresh r = refresh_state(sh, candidates, false);
-	if (!r.ok) return;
-	uint64_t hash = state_hash(sh.state);
-	int undo_enabled = get_menu_enabled(UNDO_NAMES);
-	int redo_enabled = get_menu_enabled(REDO_NAMES);
-
-	if (cmd == CMD_UNDO || cmd == CMD_REDO) {
-		int dir = cmd == CMD_UNDO ? -1 : 1;
-		int found = find_destination(sh, dir, hash);
-		if (found >= 0) {
-			if (cmd == CMD_UNDO) merge_skipped_undo(sh, found);
-			else merge_skipped_redo(sh, found);
-		} else if (cmd == CMD_UNDO && hash != sh.entries[sh.pos].hash) {
-			// 開始時点より前の状態へのUndo: 先頭に足す
-			Entry e;
-			e.hash = hash;
-			e.label = L"開始時点";
-			sh.entries[0].label = L"(開始時点より前の編集)";
-			sh.entries.insert(sh.entries.begin(), e);
-			sh.pos = 0;
-		} else if (hash != sh.entries[sh.pos].hash) {
-			reset_history(sh, cmd == CMD_UNDO ? L"元に戻した先が見つからない" : L"やり直した先が見つからない");
-		}
-	} else {
-		// 数値欄へのキーボード入力の途中か (キー入力の直後に1つの数値項目だけが変わった)
-		// 入力は確定するまで本体の履歴に積まれないので、本体の「やり直し」が有効のままでも新しい編集として扱う
-		OBJECT_HANDLE handle = nullptr;
-		std::string effect, key, before, after;
-		ULONGLONG now = GetTickCount64();
-		bool typing = now - g_last_input_key_tick < INPUT_KEY_WINDOW_MS &&
-			single_numeric_change(r, handle, effect, key, before, after);
-		if (typing) {
-			Entry& top = sh.entries[sh.pos];
-			bool same_session = (g_input_open && top.input_session == g_input_session) ||
-				(top.input_session == g_closed_session && now - g_input_close_tick < INPUT_CLOSE_GRACE_MS);
-			if (sh.pos == (int)sh.entries.size() - 1 && top.input_object == handle &&
-				top.input_effect == effect && top.input_key == key && same_session) {
-				// 同じ入力の続き: 同じ項目を上書きする (本体のUndoは確定した値の1件だけ)
-				top.hash = hash;
-				if (top.has_change && r.objects.size() == 1) top.change_after = r.objects[0].after;
-				auto it = sh.state.objects.find(handle);
-				std::wstring title = it != sh.state.objects.end() ? object_title(it->second) + L" " : L"";
-				top.label = title + (effect.empty() ? L"" : utf8_to_wide(effect) + L" ") + utf8_to_wide(key) +
-					describe_value_change(top.input_before, after);
-				// 入力した結果が入力前と同じ状態に戻った場合、本体の履歴には何も積まれないので項目を消し、預けたやり直せる分を戻す
-				if (sh.pos > 0 && sh.entries[sh.pos - 1].hash == hash) {
-					std::vector<Entry> future = std::move(top.stashed_future);
-					sh.entries.pop_back();
-					sh.pos--;
-					for (auto& e : future) sh.entries.push_back(std::move(e));
-				}
-			} else {
-				std::vector<Entry> future(sh.entries.begin() + sh.pos + 1, sh.entries.end());
-				add_edit(sh, r, hash);
-				Entry& e = sh.entries[sh.pos];
-				e.input_object = handle;
-				e.input_effect = effect;
-				e.input_key = key;
-				e.input_before = before;
-				e.input_session = g_input_open ? g_input_session : g_closed_session;
-				e.stashed_future = std::move(future);
-			}
-		} else if (redo_enabled == 0) {
-			// やり直しが無効 = 新しい編集 (または最新の状態までのRedoを取りこぼした)
-			if (r.empty() && hash == sh.entries[sh.pos].hash) {
-				// 選択外のオブジェクトの編集(プレビューでのマウス操作・オブジェクトリストからの変更等)かもしれないので読み直して探す。
-				// 設定で有効なら全オブジェクト、無効なら再生位置にあるオブジェクトだけ (1レイヤーに1個なので数が限られる)。
-				// レイヤー設定の編集もここに来るので、見つからなければレイヤー設定を読む (こちらも設定で有効な時だけ)
-				if (g_track_other_objects) {
-					r = refresh_state(sh, {}, true);
-				} else {
-					EDIT_INFO info = {};
-					edit_handle->get_edit_info(&info, sizeof(info));
-					std::set<OBJECT_HANDLE> at_cursor;
-					for (auto& [h, o] : sh.state.objects) {
-						if (o.lf.start <= info.frame && info.frame <= o.lf.end) at_cursor.insert(h);
-					}
-					if (!at_cursor.empty()) r = refresh_state(sh, at_cursor, false);
-					if (r.empty()) refresh_project_file(sh, r);
-				}
-				hash = state_hash(sh.state);
-			}
-			if (hash == sh.entries[sh.pos].hash) {
-				// 内容が変わっていない (1回の編集で通知が2件来た2件目など)
-			} else if (sh.pos + 1 == (int)sh.entries.size() - 1 && sh.entries[sh.pos + 1].hash == hash) {
-				sh.pos++;
-			} else {
-				add_edit(sh, r, hash);
-			}
-		} else if (redo_enabled == 1) {
-			// やり直しが有効なのにコマンドを観測していない: 取りこぼしたUndo/Redoとみなし、近い方へ
-			if (hash != sh.entries[sh.pos].hash) {
-				int back = find_nearest(sh, hash, -1);
-				int forward = find_nearest(sh, hash, 1);
-				if (back < 0 && forward < 0) {
-					refresh_state(sh, {}, true);
-					hash = state_hash(sh.state);
-					back = find_nearest(sh, hash, -1);
-					forward = find_nearest(sh, hash, 1);
-				}
-				if (back >= 0 && (forward < 0 || sh.pos - back <= forward - sh.pos)) merge_skipped_undo(sh, back);
-				else if (forward >= 0) merge_skipped_redo(sh, forward);
-				else reset_history(sh, L"Undo/Redoの行き先が見つからない");
-			}
-		}
-	}
-
-	// クリックで戻している途中なら、進み具合を確かめる (先頭を詰める前の位置で判断する)
-	bool send_next = false;
-	if (g_jump.active) {
-		if (sh.pos == g_jump.target) {
-			g_jump.active = false;
-			KillTimer(g_hwnd, TIMER_ID_JUMP_TIMEOUT);
-		} else if (cmd == CMD_NONE) {
-			abort_jump(L"移動中に編集された");
-		} else if ((g_jump.target < g_jump.last_pos) != (sh.pos < g_jump.last_pos) || sh.pos == g_jump.last_pos) {
-			abort_jump(L"想定と違う位置に移動した");
-		} else {
-			send_next = true;
-		}
-	}
-
-	// 本体の履歴の先頭なら、写しの前を詰める (Undoの上限に達した場合など)
-	// 数値欄への入力が確定していない間は本体のUndo履歴にまだ積まれていないので詰めない
-	if (undo_enabled == 0 && sh.pos > 0 && !is_input_pending(sh.entries[sh.pos])) {
-		adjust_jump_target(0, sh.pos, 0);
-		sh.entries.erase(sh.entries.begin(), sh.entries.begin() + sh.pos);
-		sh.entries[0].label = L"開始時点";
-		sh.pos = 0;
-		if (send_next && g_jump.target == 0) {
-			send_next = false;
-			g_jump.active = false;
-			KillTimer(g_hwnd, TIMER_ID_JUMP_TIMEOUT);
-		}
-	}
-	// Escで中止 (戻している間は入力が処理されずキーボードフックにも届かないので、キーの状態を直接見る)
-	if (send_next && is_escape_pressed()) {
-		send_next = false;
-		abort_jump(L"Escで中止した");
-	}
-	// 次のコマンドはすぐに送る。投げたメッセージは入力・再描画より先に処理されるので、戻し終わるまで
-	// ユーザーの入力は処理されず、戻し終わった後に順に処理される (途中で編集されて移動が中止されることが無い)。
-	// 本体の画面・一覧も更新されないので、戻している途中の帯はsend_next_jump_command()で直接描く
-	if (send_next) send_next_jump_command();
-	update_list();
-}
-
-// 観測したUndo/Redoに通知が来ないまま時間が経った: グループ化のUndo/Redoかもしれないので、プロジェクトファイルを読んで確かめる。
-// グループかレイヤー設定が変わっていれば、観測したコマンドの行き先を探す (変わっていなければ、通知が遅れているだけとみなして待つ)
-void check_unnotified_command() {
-	if (!g_track_layer_settings || !g_initialized || g_observed.empty()) return;
-	SceneHistory& sh = current_history();
-	Refresh r;
-	refresh_project_file(sh, r);
-	if (r.empty()) return;
-	process_update();
 }
 
 //=======================================================================
@@ -2095,12 +1819,11 @@ void send_next_jump_command() {
 		abort_jump(L"目標の項目が無くなった");
 		return;
 	}
+	// 元に戻せるか・やり直せるかは写しの現在位置で分かる (写しは本体の履歴と一致している)
 	bool undo = g_jump.target < sh.pos;
-	const wchar_t* name = undo ? L"元に戻す" : L"やり直し";	// ログに出す名前
-	const wchar_t* const* names = undo ? UNDO_NAMES : REDO_NAMES;
-	UINT id = find_menu_id(names);
-	if (!id || get_menu_enabled(names) != 1) {
-		abort_jump(std::wstring(L"「") + name + L"」が使えない");
+	UINT id = undo ? g_jump.undo_id : g_jump.redo_id;
+	if (undo ? sh.pos <= 0 : sh.pos >= (int)sh.entries.size() - 1) {
+		abort_jump(undo ? L"これより前に戻せない" : L"これより後にやり直せない");
 		return;
 	}
 	if (++g_jump.sent > g_jump.max_send) {
@@ -2109,12 +1832,10 @@ void send_next_jump_command() {
 	}
 	g_jump.last_pos = sh.pos;
 	g_jump.sent_tick = GetTickCount64();
-	g_jump.unnotified_checked = false;
 	SetTimer(g_hwnd, TIMER_ID_JUMP_TIMEOUT, JUMP_TIMEOUT_MS, nullptr);
-	// メニューのWM_COMMANDはサブクラスで観測され、通知と組になってUndo/Redoとして判定される
 	PostMessageW(edit_handle->get_host_app_window(), WM_COMMAND, MAKEWPARAM(id, 0), 0);
-	// 通知が来るまでの間も投げたメッセージを絶やさない (絶えると、その隙にユーザーの入力が処理されて編集が割り込み、
-	// 自分のUndo/Redoのコマンドと組にされて「行き先が見つからない」になった)
+	// 戻し終わるまで投げたメッセージを絶やさない (絶えると、その隙にユーザーの入力が処理されて編集が割り込む)。
+	// 本体の履歴の変化もこの中で確かめる (タイマーは処理されなくなるため)
 	if (!g_jump.keeping) {
 		g_jump.keeping = true;
 		PostMessageW(g_hwnd, WM_APP_JUMP_KEEP, 0, 0);
@@ -2124,11 +1845,16 @@ void send_next_jump_command() {
 void start_jump(int target) {
 	SceneHistory& sh = current_history();
 	if (g_jump.active || target == sh.pos || target < 0 || target >= (int)sh.entries.size()) return;
+	g_jump.undo_id = find_menu_id(UNDO_NAMES);
+	g_jump.redo_id = find_menu_id(REDO_NAMES);
+	if (!g_jump.undo_id || !g_jump.redo_id) {
+		log_line(L"[EditHistory] メニューに「元に戻す」「やり直し」が見つからないので移動できません");
+		return;
+	}
 	g_jump.active = true;
 	g_jump.target = target;
 	g_jump.sent = 0;
-	// 写しに無い途中の状態が挟まっている可能性があるので余裕を持たせる
-	g_jump.max_send = std::abs(target - sh.pos) * 2 + 5;
+	g_jump.max_send = std::abs(target - sh.pos) + 5;
 	GetAsyncKeyState(VK_ESCAPE);	// 前に押されたEscで中止しないよう、押された記録を読み捨てる
 	// 戻している間は本体がマウスの処理(カーソルの形を決め直すWM_SETCURSOR)をしないので、ここで待機にすればAviUtl2全体で待機のままになる
 	SetCursor(LoadCursor(nullptr, IDC_WAIT));
@@ -2142,7 +1868,7 @@ void start_jump(int target) {
 //	一覧の表示
 //=======================================================================
 
-// 一覧の1行 (同じオブジェクトへの連続したテキスト入力は1行にまとめる)
+// 一覧の1行 (同じ対象への同じ種類の連続した変更は1行にまとめる)
 struct Row {
 	int first = 0, last = 0;	// まとめたentriesの範囲
 };
@@ -2160,12 +1886,12 @@ void build_rows() {
 	SceneHistory& sh = current_history();
 	for (int i = 0; i < (int)sh.entries.size(); i++) {
 		const Entry& e = sh.entries[i];
-		if (!g_rows.empty() && e.text_object && i > 0) {
+		if (!g_rows.empty() && !e.merge_key.empty() && i > 0) {
 			const Row& prev = g_rows.back();
 			const Entry& p = sh.entries[prev.last];
 			// 現在位置をまたいでまとめると、やり直せる分との境目が分からなくなるのでまとめない
 			bool crosses = prev.last <= sh.pos && i > sh.pos;
-			if (p.text_object == e.text_object && p.text_item == e.text_item && !crosses) {
+			if (p.merge_object == e.merge_object && p.merge_key == e.merge_key && !crosses) {
 				g_rows.back().last = i;
 				continue;
 			}
@@ -2192,37 +1918,80 @@ void update_list() {
 	InvalidateRect(g_list, nullptr, TRUE);
 }
 
+COLORREF mix_color(COLORREF a, COLORREF b, int percent);
+
+// テキストの入力の差分の表示 (増えた文字・消えた文字と、その前後の少しの文字)
+struct TextSegment {
+	std::wstring text;
+	int style = 0;	// 0: そのまま / 1: 増えた文字 / 2: 消えた文字
+};
+
+// 入力前の全文 (入力後の全文から、挿入した文字列を除き削除した文字列を戻す)
+bool text_before(const Entry& e, std::wstring& out) {
+	const std::wstring& a = e.text_after;
+	size_t pos = (size_t)std::max(0, e.text_pos);
+	if (!e.text_full_known || pos > a.size() || a.compare(pos, e.text_inserted.size(), e.text_inserted) != 0) return false;
+	out = a.substr(0, pos) + e.text_removed + a.substr(pos + e.text_inserted.size());
+	return true;
+}
+
+// 一覧の行(entries[first..last])のテキストの入力の差分 (テキストの入力の行でなければfalse)
+bool text_segments(const std::vector<Entry>& entries, int first, int last, std::vector<TextSegment>& out) {
+	const Entry& f = entries[first];
+	const Entry& l = entries[last];
+	// 1つの文字列の項目だけを変えた段(まとめる情報が付く)に限る (他の変更も含む段は、ふつうの説明を出す)
+	if (!l.has_text || l.merge_key.empty() || l.merge_key[0] != '\x1f') return false;
+	auto flat = [](const std::wstring& t) {
+		std::wstring r;
+		for (wchar_t c : t) r += (c == L'\n' || c == L'\r' || c == L'\t') ? L' ' : c;
+		return r;
+	};
+	const size_t CONTEXT = 8;
+	std::wstring before;
+	out.clear();
+	if (l.text_full_known && text_before(f, before)) {
+		// 最初の入力前と最後の入力後を比べ、前後の一致する部分を除いた所を増えた・消えた文字とする
+		const std::wstring& after = l.text_after;
+		size_t p = 0;
+		while (p < before.size() && p < after.size() && before[p] == after[p]) p++;
+		size_t q = 0;
+		while (q < before.size() - p && q < after.size() - p && before[before.size() - 1 - q] == after[after.size() - 1 - q]) q++;
+		std::wstring head = after.substr(0, p), tail = after.substr(after.size() - q);
+		if (head.size() > CONTEXT) head = L"…" + head.substr(head.size() - CONTEXT);
+		if (tail.size() > CONTEXT) tail = tail.substr(0, CONTEXT) + L"…";
+		out.push_back({ flat(head), 0 });
+		out.push_back({ shorten(before.substr(p, before.size() - p - q)), 2 });
+		out.push_back({ shorten(after.substr(p, after.size() - p - q)), 1 });
+		out.push_back({ flat(tail), 0 });
+		return true;
+	}
+	if (first != last) return false;
+	// 入力後の全文が分からない (最新でない段): 削除・挿入した文字列だけ
+	out.push_back({ shorten(l.text_removed), 2 });
+	out.push_back({ shorten(l.text_inserted), 1 });
+	return true;
+}
+
 void draw_item(const DRAWITEMSTRUCT* dis) {
 	if (dis->itemID == (UINT)-1 || dis->itemID >= g_rows.size()) return;
 	const Row& row = g_rows[dis->itemID];
 	SceneHistory& sh = current_history();
 	bool current = row.first <= sh.pos && sh.pos <= row.last;
 	bool future = row.first > sh.pos;
+	bool merged = row.last > row.first;
 	COLORREF back = current ? color_from_config("GroupingSelect", RGB(0x48, 0x48, 0x48)) : color_from_config("Background", RGB(0x20, 0x20, 0x20));
 	COLORREF text = future ? color_from_config("TextDisable", RGB(0x90, 0x90, 0x90)) : color_from_config("Text", RGB(0xff, 0xff, 0xff));
 	HBRUSH brush = CreateSolidBrush(back);
 	FillRect(dis->hDC, &dis->rcItem, brush);
 	DeleteObject(brush);
 
-	// まとめた行は、最後の項目のラベル (入力後の内容) を出す。
-	// 同じパラメータ・位置の連続した変更をまとめた行は、最初の変更前→最後の変更後の変化として説明し直す
-	std::wstring label = sh.entries[row.last].label;
-	const Entry& first_entry = sh.entries[row.first];
-	const Entry& last_entry = sh.entries[row.last];
-	if (row.last > row.first && first_entry.has_change && last_entry.has_change && !last_entry.text_item.empty() &&
-		(last_entry.text_item[0] == '\x1c' || last_entry.text_item[0] == '\x1d')) {
-		ObjChange c;
-		c.handle = last_entry.text_object;
-		c.before = first_entry.change_before;
-		c.after = last_entry.change_after;
-		c.moved = !same_lf(c.before.lf, c.after.lf);
-		c.content = c.before.alias_hash != c.after.alias_hash;
-		std::string item;
-		label = describe_object_change(c, item);
-	}
-	if (row.last > row.first && !last_entry.text_item.empty() && last_entry.text_item[0] == '\x1b') {
-		label = last_entry.setting_prefix + first_entry.setting_before + L"→" + last_entry.setting_after;
-	}
+	// まとめた行は、最後の項目のラベル (入力後の内容等) を出す。
+	// 同じパラメータ・位置・レイヤー設定の連続した変更をまとめた行は、最初の変更前→最後の変更後の変化として説明し直す
+	std::wstring label = merged ? merged_label(sh.entries, row.first, row.last) : sh.entries[row.last].label;
+	std::vector<TextSegment> segments;
+	bool has_segments = g_undo.ok && text_segments(sh.entries, row.first, row.last, segments);
+	// 本体のUndo履歴を割り出せなかった版では、記録できないことを表示する
+	if (g_initialized && !g_undo.ok) label = L"この版のAviUtl2には対応していません (" + g_undo.error + L")";
 	SetBkMode(dis->hDC, TRANSPARENT);
 	SetTextColor(dis->hDC, text);
 	HGDIOBJ old = g_font ? SelectObject(dis->hDC, g_font) : nullptr;
@@ -2234,12 +2003,43 @@ void draw_item(const DRAWITEMSTRUCT* dis) {
 	RECT rc_number = dis->rcItem;
 	rc_number.left += 4;
 	rc_number.right = rc_number.left + digit.cx;
+	// 複数の編集をまとめた行は、左端から番号の右までを少し明るくして区別する
+	if (merged) {
+		RECT mark = dis->rcItem;
+		mark.right = rc_number.right + 5;
+		HBRUSH mark_brush = CreateSolidBrush(mix_color(back, color_from_config("Text", RGB(0xff, 0xff, 0xff)), 12));
+		FillRect(dis->hDC, &mark, mark_brush);
+		DeleteObject(mark_brush);
+	}
 	std::wstring number_text = std::to_wstring(number);
 	DrawTextW(dis->hDC, number_text.c_str(), -1, &rc_number, DT_SINGLELINE | DT_VCENTER | DT_RIGHT | DT_NOPREFIX);
 	RECT rc = dis->rcItem;
 	rc.left = rc_number.right + 10;
 	rc.right -= 4;
-	DrawTextW(dis->hDC, label.c_str(), -1, &rc, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+	if (has_segments) {
+		// テキストの入力: 増えた文字を緑、消えた文字を取り消し線付きの赤で描く
+		const Entry& l = sh.entries[row.last];
+		std::vector<TextSegment> pieces = { { l.text_head + L"入力 (", 0 } };
+		for (auto& seg : segments) if (!seg.text.empty()) pieces.push_back(seg);
+		pieces.push_back({ L")", 0 });
+		COLORREF added = RGB(0x5c, 0xd0, 0x6c), removed = RGB(0xf0, 0x64, 0x64);
+		if (future) { added = mix_color(added, back, 45); removed = mix_color(removed, back, 45); }
+		int x = rc.left;
+		for (auto& piece : pieces) {
+			if (x >= rc.right) break;
+			HGDIOBJ font = piece.style == 2 && g_font_strike ? g_font_strike : g_font;
+			if (font) SelectObject(dis->hDC, font);
+			SetTextColor(dis->hDC, piece.style == 1 ? added : piece.style == 2 ? removed : text);
+			RECT r = { x, rc.top, rc.right, rc.bottom };
+			DrawTextW(dis->hDC, piece.text.c_str(), -1, &r, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+			SIZE size = {};
+			GetTextExtentPoint32W(dis->hDC, piece.text.c_str(), (int)piece.text.size(), &size);
+			x += size.cx;
+		}
+		SetTextColor(dis->hDC, text);
+	} else {
+		DrawTextW(dis->hDC, label.c_str(), -1, &rc, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+	}
 	if (old) SelectObject(dis->hDC, old);
 	// 現在の時点の行の下に線を引く (ここより下がやり直せる分)
 	if (current) {
@@ -2375,55 +2175,6 @@ void save_zoom() {
 	WritePrivateProfileStringW(L"EditHistory", L"Zoom", std::to_wstring(g_zoom).c_str(), path.c_str());
 }
 
-void load_options() {
-	std::wstring path = ini_path();
-	if (path.empty()) return;
-	g_track_layer_settings = GetPrivateProfileIntW(L"EditHistory", L"LayerSettings", 1, path.c_str()) != 0;
-	g_track_other_objects = GetPrivateProfileIntW(L"EditHistory", L"OtherObjects", 1, path.c_str()) != 0;
-}
-
-void save_options() {
-	std::wstring path = ini_path();
-	if (path.empty()) return;
-	WritePrivateProfileStringW(L"EditHistory", L"LayerSettings", g_track_layer_settings ? L"1" : L"0", path.c_str());
-	WritePrivateProfileStringW(L"EditHistory", L"OtherObjects", g_track_other_objects ? L"1" : L"0", path.c_str());
-}
-
-// 一覧の右クリックのメニュー
-#define IDM_LAYER_SETTINGS	1
-#define IDM_OTHER_OBJECTS	2
-
-void show_context_menu(HWND hwnd, LPARAM lparam) {
-	POINT pt = { GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam) };
-	if (lparam == -1) {	// キーボードから開いた時は一覧の左上に出す
-		pt = { 0, 0 };
-		ClientToScreen(hwnd, &pt);
-	}
-	HMENU menu = CreatePopupMenu();
-	if (!menu) return;
-	UINT grayed = g_jump.active || !g_initialized ? MF_GRAYED : 0;
-	AppendMenuW(menu, MF_STRING | (g_track_other_objects ? MF_CHECKED : 0) | grayed, IDM_OTHER_OBJECTS,
-		L"選択中・再生位置以外のオブジェクトの変更も記録する (オブジェクトが多いと重くなります)");
-	AppendMenuW(menu, MF_STRING | (g_track_layer_settings ? MF_CHECKED : 0) | grayed, IDM_LAYER_SETTINGS,
-		L"レイヤー設定・グループ化の変更も記録する (試験的)");
-	int command = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, nullptr);
-	DestroyMenu(menu);
-	if (command == IDM_OTHER_OBJECTS) {
-		// 状態のハッシュの中身は変わらないので、履歴は取り直さない
-		g_track_other_objects = !g_track_other_objects;
-		save_options();
-	}
-	if (command == IDM_LAYER_SETTINGS) {
-		g_track_layer_settings = !g_track_layer_settings;
-		save_options();
-		// 記録する内容(状態のハッシュ)が変わり、今までの履歴と照らし合わせられなくなるので取り直す
-		g_scenes.clear();
-		g_scene_id = -1;
-		ensure_scene();
-		update_list();
-		log_line(L"[EditHistory] 履歴を取り直しました (レイヤー設定の記録を切り替えた)");
-	}
-}
 
 int list_item_height() {
 	return std::max(g_item_height * g_zoom / 100, (int)(g_font_size * g_zoom / 100.0f * 1.4f));
@@ -2436,6 +2187,10 @@ void apply_zoom() {
 	if (!font) return;
 	if (g_font) DeleteObject(g_font);
 	g_font = font;
+	HFONT strike = CreateFontW(-(int)(g_font_size * g_zoom / 100.0f + 0.5f), 0, 0, 0, FW_NORMAL, FALSE, FALSE, TRUE, DEFAULT_CHARSET,
+		OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, g_font_name.c_str());
+	if (g_font_strike) DeleteObject(g_font_strike);
+	g_font_strike = strike;
 	if (g_list) {
 		SendMessageW(g_list, LB_SETITEMHEIGHT, 0, list_item_height());
 		InvalidateRect(g_list, nullptr, TRUE);
@@ -2476,10 +2231,6 @@ LRESULT CALLBACK list_subclass_proc(HWND hwnd, UINT message, WPARAM wparam, LPAR
 			apply_zoom();
 			save_zoom();
 		}
-		return 0;
-	}
-	if (message == WM_CONTEXTMENU) {
-		show_context_menu(hwnd, lparam);
 		return 0;
 	}
 	return DefSubclassProc(hwnd, message, wparam, lparam);
@@ -2523,60 +2274,35 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
 				SetTimer(hwnd, TIMER_ID_INIT, INIT_RETRY_MS, nullptr);
 				return 0;
 			}
-			read_shortcuts();
-			if (!g_undo_id || !g_redo_id) log_line(L"[EditHistory] メニューに「元に戻す」「やり直し」が見つかりません");
-			g_keyboard_hook = SetWindowsHookExW(WH_KEYBOARD, keyboard_hook_proc, nullptr, GetCurrentThreadId());
-			g_mouse_hook = SetWindowsHookExW(WH_MOUSE, mouse_hook_proc, nullptr, GetCurrentThreadId());
-			g_callwnd_hook = SetWindowsHookExW(WH_CALLWNDPROC, callwnd_hook_proc, nullptr, GetCurrentThreadId());
-			g_subclassed = SetWindowSubclass(main, main_subclass_proc, 1, 0) != FALSE;
+			if (!find_menu_id(UNDO_NAMES) || !find_menu_id(REDO_NAMES)) log_line(L"[EditHistory] メニューに「元に戻す」「やり直し」が見つかりません");
+			if (locate_undo()) {
+				wchar_t buf[160];
+				swprintf_s(buf, L"[EditHistory] 本体のUndo履歴を見つけました (+0x%zX, 履歴=+0x%X, 位置=+0x%X, 項目の種類=%zu)",
+					g_undo.service_slot - (uintptr_t)GetModuleHandleW(nullptr), g_undo.hist_off, g_undo.pos_off, g_undo.vtables.size());
+				log_line(buf);
+			} else {
+				log_line(L"[EditHistory] この版の本体には対応していません (" + g_undo.error + L")");
+			}
 			g_initialized = true;
-			ensure_scene();
+			process_update();
 			update_list();
+			if (g_undo.ok) SetTimer(hwnd, TIMER_ID_POLL, POLL_INTERVAL_MS, nullptr);
 		}
 		return 0;
 
 	case WM_APP_OBJECT_UPDATED:
-		if (!g_initialized) return 0;
-		// 解放を取りこぼした時(右クリックのメニュー等)に押下中のままにならないよう、どのボタンも押されていなければ解除する。
-		// 物理的な状態(GetAsyncKeyState)ではなく、このスレッドが処理した入力での状態(GetKeyState)で見る。
-		// クリックで戻している間に溜まった入力が後でまとめて処理される時、物理的にはとっくに離していても
-		// 本体はまだドラッグの途中なので、物理的な状態で解除すると確定前の通知を処理して履歴を取り直してしまった
-		if (g_button_down && GetKeyState(VK_LBUTTON) >= 0 && GetKeyState(VK_RBUTTON) >= 0 && GetKeyState(VK_MBUTTON) >= 0) {
-			g_buttons = 0;
-			g_button_down = false;
-		}
-		if (is_keychain_active()) {
-			// Keychain to Transformの操作中はまとめて、終了のメッセージで処理する
-			g_pending_update = true;
-		} else if (g_button_down && !g_jump.active) {
-			// 押下中はまとめて、解放で処理する (一覧のクリックで戻している途中は、押下中でもすぐ処理する)
-			g_pending_update = true;
-		} else {
-			process_update();
-		}
-		return 0;
-
-	case WM_APP_EXTERNAL_FINISHED:
-		// Keychain to Transformの操作が終わった
-		if (!g_initialized) return 0;
-		if (wparam == KEYCHAIN_RESULT_CANCELED) {
-			// 本体のやり直せる分は、キャンセルした変形の1件に置き換わっている。写しのやり直せる分は本体に無いので捨てる
-			// (その後に本体でやり直すと写しに行き先が無いので、従来どおり取り直しになる)
-			ensure_scene();
-			SceneHistory& sh = current_history();
-			if (sh.pos + 1 < (int)sh.entries.size()) sh.entries.erase(sh.entries.begin() + sh.pos + 1, sh.entries.end());
-		}
-		if (g_pending_update && !g_button_down) {
-			g_pending_update = false;
-			process_update();
-		} else {
-			update_list();
-		}
+	case WM_APP_SCENE_CHANGED:
+		if (g_initialized && !g_jump.active) process_update();
 		return 0;
 
 	case WM_APP_JUMP_KEEP: {
 		// クリックで戻している間、自分宛てに投げ続けてユーザーの入力を戻し終わるまで後回しにする
-		// (タイマーも処理されなくなるので、Escと応答なしの確認、ぐるぐるを回すのもここで行う)
+		// (タイマーも処理されなくなるので、本体の履歴の確認・Escと応答なしの確認・ぐるぐるを回すのもここで行う)
+		if (!g_jump.active) {
+			g_jump.keeping = false;
+			return 0;
+		}
+		process_update();
 		if (!g_jump.active) {
 			g_jump.keeping = false;
 			return 0;
@@ -2594,17 +2320,7 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
 			update_list();
 			return 0;
 		}
-		// 送ったUndo/Redoに通知が来ない: グループ化のUndo/Redoかもしれないので確かめる (タイマーはここでは処理されない)
-		if (!g_jump.unnotified_checked && now - g_jump.sent_tick > UNNOTIFIED_WAIT_MS) {
-			g_jump.unnotified_checked = true;
-			check_unnotified_command();
-			if (!g_jump.active) {
-				g_jump.keeping = false;
-				return 0;
-			}
-		}
-		// 本体の通知が投げたメッセージの処理を待っている等で来ない場合に備え、長く来なければ投げるのをやめる
-		// (次にコマンドを送る時にまた始める。応答なしの判定はタイマーで行われる)
+		// 長く変化が無ければ投げるのをやめる (次にコマンドを送る時にまた始める。応答なしの判定はタイマーで行われる)
 		if (now - g_jump.sent_tick > JUMP_KEEP_MAX_MS) {
 			g_jump.keeping = false;
 			return 0;
@@ -2620,34 +2336,15 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
 		return 0;
 	}
 
-	case WM_APP_GROUP_COMMAND:
-		// グループ化・グループ解除: 通知が来ないので、本体が処理し終えた後に通知が来たのと同じように確かめる
-		// (変化が見つからない時はプロジェクトファイルを読むので、グループの変化が項目になる)
-		if (g_initialized && !g_jump.active) process_update();
-		return 0;
-
-	case WM_APP_RELEASED:
-		if (g_pending_update && !g_button_down) {
-			g_pending_update = false;
-			process_update();
-		}
-		return 0;
-
-	case WM_APP_SCENE_CHANGED:
-		if (g_initialized) process_update();
-		return 0;
-
 	case WM_APP_PROJECT_LOADED:
 		// プロジェクトの読み込み・新規作成で本体のUndo履歴は空になるので、全シーンの写しを捨てる
 		abort_jump(L"プロジェクトが読み込まれた");
 		g_scenes.clear();
 		g_scene_id = -1;
-		g_observed.clear();
-		g_pending_update = false;
 		// プロジェクトの初期化・読み込みが済んだので、編集ハンドルの関数を使える (起動時にも必ず1回来る)
 		g_host_ready = true;
 		if (g_initialized) {
-			ensure_scene();
+			process_update();
 			update_list();
 		} else {
 			PostMessageW(hwnd, WM_APP_INIT, 0, 0);
@@ -2660,9 +2357,9 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
 			PostMessageW(hwnd, WM_APP_INIT, 0, 0);
 			return 0;
 		}
-		if (wparam == TIMER_ID_UNNOTIFIED) {
-			KillTimer(hwnd, TIMER_ID_UNNOTIFIED);
-			if (!g_jump.active) check_unnotified_command();
+		if (wparam == TIMER_ID_POLL) {
+			// 通知の来ない編集(グループ化等)・Undo/Redoもあるので、定期的に本体の履歴を確かめる (変化が無ければ数十個の値を読むだけ)
+			if (g_initialized && !g_jump.active) process_update();
 			return 0;
 		}
 		if (wparam == TIMER_ID_BUSY) {
@@ -2690,12 +2387,9 @@ void on_scene_changed(void*) { PostMessageW(g_hwnd, WM_APP_SCENE_CHANGED, 0, 0);
 void on_project_load(PROJECT_FILE*) { PostMessageW(g_hwnd, WM_APP_PROJECT_LOADED, 0, 0); }
 
 EXTERN_C __declspec(dllexport) void UninitializePlugin() {
-	if (g_keyboard_hook) UnhookWindowsHookEx(g_keyboard_hook);
-	if (g_mouse_hook) UnhookWindowsHookEx(g_mouse_hook);
-	if (g_callwnd_hook) UnhookWindowsHookEx(g_callwnd_hook);
-	if (g_subclassed && edit_handle) RemoveWindowSubclass(edit_handle->get_host_app_window(), main_subclass_proc, 1);
 	if (g_list) RemoveWindowSubclass(g_list, list_subclass_proc, 1);
 	if (g_font) DeleteObject(g_font);
+	if (g_font_strike) DeleteObject(g_font_strike);
 	if (g_back_brush) DeleteObject(g_back_brush);
 }
 
@@ -2721,7 +2415,6 @@ EXTERN_C __declspec(dllexport) void RegisterPlugin(HOST_APP_TABLE* host) {
 		if (height > 0) g_item_height = height;
 	}
 	load_zoom();
-	load_options();
 	apply_zoom();
 	// 戻している途中の帯と重なるので、一覧は兄弟ウィンドウの上に描かないようにする
 	// (クリックはサブクラスで自分で処理するので、選択の通知(LBS_NOTIFY)は使わない)
